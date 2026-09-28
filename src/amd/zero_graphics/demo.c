@@ -1,0 +1,18 @@
+#include "zgfx.h"
+
+int
+main(void)
+{
+   zgfx_hello_world();
+
+   zgfx_device* dev = device_create();
+   zgfx_command *cmd = command_begin(dev);
+   // void *backbuffer = galloct(dev, 1024, 1024, ZGFX_COLOR_RGBA8_UNORM, 1, 1);
+   command_nop(cmd);
+   // printf("col: %08x\n", ((uint32_t *)backbuffer)[128]);
+   // command_clear(cmd, backbuffer, 0x00FF0000, 0);
+   queue_submit(dev, cmd);
+   // printf("col: %08x\n", ((uint32_t *)backbuffer)[128]);
+
+   return 0;
+}

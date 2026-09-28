@@ -302,6 +302,7 @@ endif
 with_intel_vk = _vulkan_drivers.contains('intel')
 with_intel_hasvk = _vulkan_drivers.contains('intel_hasvk')
 with_amd_vk = _vulkan_drivers.contains('amd')
+with_zero_graphics = get_option('zero-graphics')
 with_freedreno_vk = _vulkan_drivers.contains('freedreno')
 with_panfrost_vk = _vulkan_drivers.contains('panfrost')
 with_swrast_vk = _vulkan_drivers.contains('swrast')
@@ -789,7 +790,7 @@ _libdrm_checks = {
   },
   'amdgpu': {
     'version': '2.4.133',
-    'enabled': (with_amd_vk and not with_platform_windows) or with_gallium_radeonsi,
+    'enabled': (with_amd_vk and not with_platform_windows) or with_gallium_radeonsi or with_zero_graphics,
   },
 }
 
@@ -812,7 +813,7 @@ with_gallium_drisw_kms = false
 if system_has_kms_drm
   dep_libdrm = dependency(
     'libdrm', version : '>=' + _drm_ver,
-    required : with_dri2 or with_dri or with_gbm,
+    required : with_dri2 or with_dri or with_gbm or with_zero_graphics,
     allow_fallback: allow_fallback_for_libdrm,
     default_options : {
       'auto_features' : 'disabled',

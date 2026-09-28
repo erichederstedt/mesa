@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../mesa_demos"
+		},
+		{
+			"path": "../zero_graphics"
+		}
+	],
+	"settings": {}
+}

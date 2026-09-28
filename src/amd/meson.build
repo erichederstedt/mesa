@@ -7,9 +7,12 @@ if with_tools.contains('drm-shim')
   subdir('drm-shim')
 endif
 
-if with_amd_vk or with_gallium_radeonsi
+if with_amd_vk or with_gallium_radeonsi or with_zero_graphics
   subdir('addrlib')
   subdir('common')
+endif
+
+if with_amd_vk or with_gallium_radeonsi
   if amd_with_llvm
     subdir('llvm')
   else
@@ -29,4 +32,8 @@ if with_gallium_radeonsi
   subdir('vpelib')
   subdir('gmlib')
   subdir('lanczoslib')
+endif
+
+if with_zero_graphics
+  subdir('zero_graphics')
 endif
