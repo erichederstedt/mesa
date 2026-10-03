@@ -45,6 +45,14 @@ struct zgfx_command {
    zgfx_device* dev;
 };
 
+static uint64_t find_buffer(struct zgfx_device *dev, void *ptr) {
+    for (uint64_t i = 0; i < dev->buffers_count; i++) {
+        if (dev->buffers_ptr[i] == ptr)
+            return i;
+    }
+    return UINT64_MAX;
+}
+
 PUBLIC zgfx_device *device_create(void) {
    zgfx_device *dev = malloc(sizeof(zgfx_device));
    assert(dev);
@@ -319,10 +327,102 @@ static void command_grow(zgfx_command *cmd) {
 
    command_chain(cmd, old_cdw);
 }
+
+#define CP_DMA_SYNC (1 << 0)
+#define CP_DMA_RAW_WAIT (1 << 1)
+#define CP_DMA_USE_L2 (1 << 2)
+#define CP_DMA_CLEAR (1 << 3)
+#define SI_CPDMA_ALIGNMENT 32
+static unsigned cp_dma_max_byte_count(enum amd_gfx_level gfx_level) {
+   unsigned max = gfx_level >= GFX11 ? 32767 : gfx_level >= GFX9 ? S_506_BYTE_COUNT(~0u) : S_415_BYTE_COUNT(~0u);
+   return max & ~(SI_CPDMA_ALIGNMENT - 1);
+}
+static void command_emit_cp_dma(zgfx_command *cmd, bool predicating, uint64_t dst_va,
+                                uint64_t src_va, unsigned size, unsigned flags) {
+   const struct radeon_info *info = &cmd->dev->info;
+   const bool cp_dma_use_L2 = (flags & CP_DMA_USE_L2) && info->cp_dma_use_L2;
+   const bool cp_dma_use_mall = info->gfx_level == GFX12;
+   const bool cp_dma_tc_l2_flag = cp_dma_use_L2 || cp_dma_use_mall;
+   uint32_t header = 0, command = 0;
+
+   assert(size <= cp_dma_max_byte_count(info->gfx_level));
+
+   unsigned packet_dw = info->gfx_level >= GFX7 ? 7 : 6;
+   if (flags & CP_DMA_SYNC)
+      packet_dw += 2;
+   if (cmd->cs.cdw + packet_dw > cmd->cs.max_dw)
+      command_grow(cmd);
+
+   if (info->gfx_level >= GFX9)
+      command |= S_506_BYTE_COUNT(size);
+   else
+      command |= S_415_BYTE_COUNT(size);
+
+   if (flags & CP_DMA_SYNC)
+      header |= S_501_CP_SYNC(1);
+
+   if (flags & CP_DMA_RAW_WAIT)
+      command |= S_506_RAW_WAIT(1);
+
+   if (cp_dma_tc_l2_flag)
+      header |= S_501_DST_SEL(V_501_DST_ADDR_USING_L2);
+
+   if (flags & CP_DMA_CLEAR)
+      header |= S_501_SRC_SEL(V_501_DATA);
+   else if (cp_dma_tc_l2_flag)
+      header |= S_501_SRC_SEL(V_501_SRC_ADDR_USING_L2);
+
+   ac_cmdbuf_begin(&cmd->cs);
+   if (info->gfx_level >= GFX7) {
+      ac_cmdbuf_emit(PKT3(PKT3_DMA_DATA, 5, predicating));
+      ac_cmdbuf_emit(header);
+      ac_cmdbuf_emit(src_va);
+      ac_cmdbuf_emit(src_va >> 32);
+      ac_cmdbuf_emit(dst_va);
+      ac_cmdbuf_emit(dst_va >> 32);
+      ac_cmdbuf_emit(command);
+   } else {
+      assert(!cp_dma_tc_l2_flag);
+      header |= S_412_SRC_ADDR_HI(src_va >> 32);
+      ac_cmdbuf_emit(PKT3(PKT3_CP_DMA, 4, predicating));
+      ac_cmdbuf_emit(src_va);
+      ac_cmdbuf_emit(header);
+      ac_cmdbuf_emit(dst_va);
+      ac_cmdbuf_emit((dst_va >> 32) & 0xffff);
+      ac_cmdbuf_emit(command);
+   }
+   ac_cmdbuf_end();
+
+   if (flags & CP_DMA_SYNC)
+      ac_emit_cp_pfp_sync_me(&cmd->cs, predicating);
+}
+
 PUBLIC void command_nop(zgfx_command *cmd) {
+   if ((cmd->cs.cdw + 2) > cmd->cs.max_dw)
+      command_grow(cmd);
+   
    ac_emit_cp_nop(&cmd->cs, 0);
 }
-PUBLIC void command_clear(zgfx_command *cmd, void *backbuffer, uint32_t color, uint64_t size);
+PUBLIC void command_clear(zgfx_command *cmd, void *backbuffer, uint32_t color, uint64_t size) {
+   uint64_t remaining = size;
+   if (size == 0) {
+      uint64_t buffer_index = find_buffer(cmd->dev, backbuffer);
+      assert(buffer_index != UINT64_MAX && "failed to find_buffer");
+      remaining = cmd->dev->buffers_size[buffer_index];
+   }
+   uint64_t offset = 0;
+   const uint64_t max_chunk = cp_dma_max_byte_count(cmd->dev->info.gfx_level);
+   
+   while (remaining > 0) {
+      uint64_t chunk = remaining < max_chunk ? remaining : max_chunk;
+      uint64_t dst_va = (uint64_t)backbuffer + offset;
+      
+      command_emit_cp_dma(cmd, false, dst_va, color, chunk, CP_DMA_CLEAR | CP_DMA_SYNC);
+      
+      offset += chunk;
+      remaining -= chunk;
+   }
+}
 
 #define QUEUE_SUBMIT_FENCE_TIMEOUT_NS (10ull * 1000 * 1000 * 1000)
 PUBLIC void queue_submit(zgfx_device *dev, zgfx_command *cmd) {
