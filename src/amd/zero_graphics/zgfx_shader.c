@@ -16,19 +16,6 @@
 #include "sid.h"
 #include "util/macros.h"
 
-struct zgfx_shader {
-   zgfx_device *dev;
-   void *code;
-   uint32_t code_size;
-   uint32_t exec_size;
-   struct ac_shader_config config;
-   uint32_t workgroup_size[3];
-   uint32_t wave_size;
-   uint32_t num_user_sgprs;
-   struct ac_shader_args args;
-   struct ac_arg argument_ptr;
-};
-
 static bool shader_check_spirv(const uint32_t *words, size_t count)
 {
    if (words[0] != SpvMagicNumber)

@@ -347,6 +347,7 @@ PUBLIC zgfx_command *command_begin(zgfx_device *dev) {
    cmd->ib_count = 1;
    cmd->ib_capacity = 8;
    cmd->dev = dev;
+   cmd->compute_shader = NULL;
 
    command_emit_graphics(cmd);
 
@@ -535,9 +536,105 @@ PUBLIC void command_clear(zgfx_command *cmd, void *backbuffer, uint32_t color, u
       remaining -= chunk;
    }
 }
-PUBLIC void command_set_compute_shader(zgfx_command *cmd, zgfx_shader* shader) {}
-PUBLIC void command_set_compute_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data) {}
-PUBLIC void command_dispatch(zgfx_command *cmd, int x, int y, int z) {}
+PUBLIC void command_set_compute_shader(zgfx_command *cmd, zgfx_shader* shader) {
+   assert(cmd && shader && cmd->dev == shader->dev);
+   assert(shader->code && !shader->config.scratch_bytes_per_wave);
+
+   const struct radeon_info *info = &cmd->dev->info;
+   uint64_t va = (uint64_t)(uintptr_t)shader->code;
+   assert((va & 255) == 0);
+
+   unsigned threads = shader->workgroup_size[0] * shader->workgroup_size[1] * shader->workgroup_size[2];
+   unsigned waves = DIV_ROUND_UP(threads, shader->wave_size);
+   unsigned threadgroups_per_cu = info->gfx_level >= GFX10 && waves == 1 ? 2 : 1;
+
+   struct ac_pm4_state pm4 = {0};
+   ac_pm4_clear_state(&pm4, info, false, false);
+   ac_pm4_set_reg(&pm4, R_00B830_COMPUTE_PGM_LO, va >> 8);
+   ac_pm4_set_reg(&pm4, R_00B834_COMPUTE_PGM_HI, S_00B834_DATA(va >> 40));
+   ac_pm4_set_reg(&pm4, R_00B848_COMPUTE_PGM_RSRC1, shader->config.rsrc1);
+   ac_pm4_set_reg(&pm4, R_00B84C_COMPUTE_PGM_RSRC2, shader->config.rsrc2);
+   if (info->gfx_level >= GFX10)
+      ac_pm4_set_reg(&pm4, R_00B8A0_COMPUTE_PGM_RSRC3, shader->config.rsrc3);
+
+   ac_pm4_set_reg(&pm4, R_00B854_COMPUTE_RESOURCE_LIMITS,
+                  ac_get_compute_resource_limits(info, waves, 0, threadgroups_per_cu));
+   if (info->gfx_level >= GFX12) {
+      ac_pm4_set_reg(&pm4, R_00B81C_COMPUTE_NUM_THREAD_X,
+                     S_00B81C_NUM_THREAD_FULL_GFX12(shader->workgroup_size[0]));
+      ac_pm4_set_reg(&pm4, R_00B820_COMPUTE_NUM_THREAD_Y,
+                     S_00B820_NUM_THREAD_FULL_GFX12(shader->workgroup_size[1]));
+   } else {
+      ac_pm4_set_reg(&pm4, R_00B81C_COMPUTE_NUM_THREAD_X,
+                     S_00B81C_NUM_THREAD_FULL_GFX6(shader->workgroup_size[0]));
+      ac_pm4_set_reg(&pm4, R_00B820_COMPUTE_NUM_THREAD_Y,
+                     S_00B820_NUM_THREAD_FULL_GFX6(shader->workgroup_size[1]));
+   }
+   ac_pm4_set_reg(&pm4, R_00B824_COMPUTE_NUM_THREAD_Z,
+                  S_00B824_NUM_THREAD_FULL(shader->workgroup_size[2]));
+
+   ac_pm4_finalize(&pm4);
+   if (cmd->cs.cdw + pm4.ndw > cmd->cs.max_dw)
+      command_grow(cmd);
+   ac_pm4_emit_commands(&cmd->cs, &pm4);
+   cmd->compute_shader = shader;
+}
+PUBLIC void command_set_compute_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data) {
+   assert(cmd && shader && cmd->dev == shader->dev);
+   assert(shader->argument_ptr.used);
+
+   unsigned offset = R_00B900_COMPUTE_USER_DATA_0 +
+                     shader->args.args[shader->argument_ptr.arg_index].offset * 4;
+   uint64_t va = (uint64_t)(uintptr_t)data;
+   struct ac_pm4_state pm4 = {0};
+   ac_pm4_clear_state(&pm4, &cmd->dev->info, false, false);
+   ac_pm4_set_reg(&pm4, offset, va);
+   ac_pm4_set_reg(&pm4, offset + 4, va >> 32);
+   ac_pm4_finalize(&pm4);
+
+   if (cmd->cs.cdw + pm4.ndw > cmd->cs.max_dw)
+      command_grow(cmd);
+   ac_pm4_emit_commands(&cmd->cs, &pm4);
+}
+PUBLIC void command_dispatch(zgfx_command *cmd, int x, int y, int z) {
+   assert(cmd && cmd->compute_shader);
+   assert(x >= 0 && y >= 0 && z >= 0);
+   if (!x || !y || !z)
+      return;
+
+   const zgfx_shader *shader = cmd->compute_shader;
+   const struct radeon_info *info = &cmd->dev->info;
+   struct ac_pm4_state pm4 = {0};
+   ac_pm4_clear_state(&pm4, info, false, false);
+   if (shader->args.num_work_groups.used) {
+      unsigned offset = R_00B900_COMPUTE_USER_DATA_0 +
+                        shader->args.args[shader->args.num_work_groups.arg_index].offset * 4;
+      ac_pm4_set_reg(&pm4, offset, x);
+      ac_pm4_set_reg(&pm4, offset + 4, y);
+      ac_pm4_set_reg(&pm4, offset + 8, z);
+   }
+   ac_pm4_finalize(&pm4);
+
+   if (cmd->cs.cdw + pm4.ndw + 5 > cmd->cs.max_dw)
+      command_grow(cmd);
+   ac_pm4_emit_commands(&cmd->cs, &pm4);
+
+   assert(shader->wave_size == 64 || (shader->wave_size == 32 && info->gfx_level >= GFX10));
+   unsigned initiator = S_00B800_COMPUTE_SHADER_EN(1) | S_00B800_FORCE_START_AT_000(1) |
+                        S_00B800_CS_W32_EN(shader->wave_size == 32);
+   if (info->gfx_level >= GFX7 && (info->family < CHIP_GFX940 || info->has_graphics))
+      initiator |= S_00B800_ORDER_MODE(1);
+   if (info->gfx_level >= GFX10)
+      initiator |= S_00B800_TUNNEL_ENABLE(1);
+
+   ac_cmdbuf_begin(&cmd->cs);
+   ac_cmdbuf_emit(PKT3(PKT3_DISPATCH_DIRECT, 3, 0) | PKT3_SHADER_TYPE_S(1));
+   ac_cmdbuf_emit(x);
+   ac_cmdbuf_emit(y);
+   ac_cmdbuf_emit(z);
+   ac_cmdbuf_emit(initiator);
+   ac_cmdbuf_end();
+}
 
 #define QUEUE_SUBMIT_FENCE_TIMEOUT_NS (10ull * 1000 * 1000 * 1000)
 PUBLIC void queue_submit(zgfx_device *dev, zgfx_command *cmd) {

@@ -5,8 +5,10 @@
 
 #include <amdgpu.h>
 
+#include "ac_binary.h"
 #include "ac_cmdbuf.h"
 #include "ac_gpu_info.h"
+#include "ac_shader_args.h"
 
 #define MAX_BUFFER_COUNT 128
 struct zgfx_device {
@@ -31,7 +33,21 @@ struct zgfx_command {
    uint64_t ib_count;
    uint64_t ib_capacity;
    zgfx_device* dev;
+   zgfx_shader *compute_shader;
 };
+struct zgfx_shader {
+   zgfx_device *dev;
+   void *code;
+   uint32_t code_size;
+   uint32_t exec_size;
+   struct ac_shader_config config;
+   uint32_t workgroup_size[3];
+   uint32_t wave_size;
+   uint32_t num_user_sgprs;
+   struct ac_shader_args args;
+   struct ac_arg argument_ptr;
+};
+
 static uint64_t find_buffer(struct zgfx_device *dev, void *ptr) {
     for (uint64_t i = 0; i < dev->buffers_count; i++) {
         if (dev->buffers_ptr[i] == ptr)
