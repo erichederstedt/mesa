@@ -1,56 +1,25 @@
-#include "zgfx.h"
+#include "zgfx_private.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <amdgpu.h>
 #include <unistd.h>
 
-#include "ac_gpu_info.h"
 #include "ac_linux_drm.h"
 #include "ac_cmdbuf.h"
 #include "ac_cmdbuf_cp.h"
+#include "ac_pm4.h"
+#include "ac_shader_args.h"
 #include "amd_family.h"
+#include "sid.h"
 #include "util/macros.h"
+#include "util/u_math.h"
 
 PUBLIC void zgfx_hello_world(void)
 {
    puts("Hello, world!");
-}
-
-#define MAX_BUFFER_COUNT 128
-struct zgfx_device {
-   int fd;
-   amdgpu_device_handle device_handle;
-   amdgpu_context_handle context_handle;
-   struct radeon_info info;
-   
-   void *buffers_raw_ptr[MAX_BUFFER_COUNT]; // SAO
-   void *buffers_ptr[MAX_BUFFER_COUNT];
-   uint64_t buffers_size[MAX_BUFFER_COUNT];
-   uint64_t buffers_align[MAX_BUFFER_COUNT];
-   amdgpu_bo_handle buffers_bo_handle[MAX_BUFFER_COUNT];
-   amdgpu_va_handle buffers_va_handle[MAX_BUFFER_COUNT];
-   uint64_t buffers_count;
-};
-struct zgfx_command {
-   struct ac_cmdbuf cs;
-   void** ib_ptrs;
-   uint64_t* ib_sizes;
-   uint64_t* ib_cwds;
-   uint64_t ib_count;
-   uint64_t ib_capacity;
-   zgfx_device* dev;
-};
-
-static uint64_t find_buffer(struct zgfx_device *dev, void *ptr) {
-    for (uint64_t i = 0; i < dev->buffers_count; i++) {
-        if (dev->buffers_ptr[i] == ptr)
-            return i;
-    }
-    return UINT64_MAX;
 }
 
 PUBLIC zgfx_device *device_create(void) {
@@ -218,6 +187,147 @@ PUBLIC void *galloct(zgfx_device *dev, uint64_t width, uint64_t height, zgfx_col
    return galloc(dev, size);
 }
 
+static void command_emit_compute(zgfx_command *cmd, bool is_compute_queue) {
+   const struct radeon_info *info = &cmd->dev->info;
+   struct ac_pm4_state *pm4 = ac_pm4_create_sized(info, false, 64, is_compute_queue);
+   assert(pm4);
+
+   const struct ac_preamble_state preamble_state = {
+      .border_color_va = 0,
+      .gfx11.compute_dispatch_interleave = 64,
+   };
+
+   ac_init_compute_preamble_state(&preamble_state, pm4);
+
+   ac_pm4_set_reg(pm4, R_00B810_COMPUTE_START_X, 0);
+   ac_pm4_set_reg(pm4, R_00B814_COMPUTE_START_Y, 0);
+   ac_pm4_set_reg(pm4, R_00B818_COMPUTE_START_Z, 0);
+
+   if (info->gfx_level >= GFX12) {
+      if (is_compute_queue) {
+         ac_pm4_set_reg(pm4, R_00B8BC_COMPUTE_DISPATCH_INTERLEAVE,
+                        S_00B8BC_INTERLEAVE_1D(preamble_state.gfx11.compute_dispatch_interleave));
+      } else {
+         ac_pm4_set_reg_custom(pm4, R_00B8BC_COMPUTE_DISPATCH_INTERLEAVE - SI_SH_REG_OFFSET,
+                               S_00B8BC_INTERLEAVE_1D(preamble_state.gfx11.compute_dispatch_interleave),
+                               PKT3_SET_SH_REG_INDEX, 2);
+      }
+   }
+
+   ac_pm4_finalize(pm4);
+   assert(cmd->cs.cdw + pm4->ndw <= cmd->cs.max_dw);
+   ac_pm4_emit_commands(&cmd->cs, pm4);
+   ac_pm4_free_state(pm4);
+}
+
+static unsigned pack_float_12p4(float x) {
+   return x <= 0 ? 0 : x >= 4096 ? 0xffff : x * 16;
+}
+
+static void command_emit_graphics(zgfx_command *cmd) {
+   const struct radeon_info *info = &cmd->dev->info;
+   const bool has_clear_state = info->has_clear_state;
+   struct ac_pm4_state *pm4 = ac_pm4_create_sized(info, false, 512, false);
+   assert(pm4);
+
+   ac_pm4_cmd_add(pm4, PKT3(PKT3_CONTEXT_CONTROL, 1, 0));
+   ac_pm4_cmd_add(pm4, S_281_UPDATE_LOAD_ENABLES(1));
+   ac_pm4_cmd_add(pm4, S_282_UPDATE_SHADOW_ENABLES(1));
+
+   if (has_clear_state) {
+      ac_pm4_cmd_add(pm4, PKT3(PKT3_CLEAR_STATE, 0, 0));
+      ac_pm4_cmd_add(pm4, 0);
+   }
+
+   const struct ac_preamble_state preamble_state = {
+      .border_color_va = 0,
+   };
+
+   ac_init_graphics_preamble_state(&preamble_state, pm4);
+
+   if (!has_clear_state) {
+      for (unsigned i = 0; i < 16; i++) {
+         ac_pm4_set_reg(pm4, R_0282D0_PA_SC_VPORT_ZMIN_0 + i * 8, 0);
+         ac_pm4_set_reg(pm4, R_0282D4_PA_SC_VPORT_ZMAX_0 + i * 8, fui(1.0));
+      }
+      ac_pm4_set_reg(pm4, R_028230_PA_SC_EDGERULE, 0xAAAAAAAA);
+   }
+
+   if (info->gfx_level <= GFX8)
+      ac_pm4_set_reg(pm4, R_00B324_SPI_SHADER_PGM_HI_ES, S_00B324_MEM_BASE(info->address32_hi >> 8));
+
+   if (info->gfx_level < GFX11)
+      ac_pm4_set_reg(pm4, R_00B124_SPI_SHADER_PGM_HI_VS, S_00B124_MEM_BASE(info->address32_hi >> 8));
+
+   if (info->gfx_level >= GFX10) {
+      unsigned vertex_reuse_depth = info->gfx_level >= GFX10_3 ? 30 : 0;
+      ac_pm4_set_reg(pm4, R_028838_PA_CL_NGG_CNTL,
+                     S_028838_INDEX_BUF_EDGE_FLAG_ENA(0) | S_028838_VERTEX_REUSE_DEPTH(vertex_reuse_depth));
+   }
+
+   unsigned tmp = (unsigned)(1.0 * 8.0);
+   ac_pm4_set_reg(pm4, R_028A00_PA_SU_POINT_SIZE, S_028A00_HEIGHT(tmp) | S_028A00_WIDTH(tmp));
+   ac_pm4_set_reg(pm4, R_028A04_PA_SU_POINT_MINMAX,
+                  S_028A04_MIN_SIZE(pack_float_12p4(0)) | S_028A04_MAX_SIZE(pack_float_12p4(8191.875 / 2)));
+
+   if (info->family >= CHIP_POLARIS10) {
+      unsigned small_prim_filter_cntl = S_028830_SMALL_PRIM_FILTER_ENABLE(1) |
+                                        S_028830_LINE_FILTER_DISABLE(info->family <= CHIP_POLARIS12) |
+                                        S_028830_SC_1XMSAA_COMPATIBLE_DISABLE(info->gfx_level >= GFX10);
+
+      ac_pm4_set_reg(pm4, R_028830_PA_SU_SMALL_PRIM_FILTER_CNTL, small_prim_filter_cntl);
+   }
+
+   if (info->gfx_level >= GFX12) {
+      ac_pm4_set_reg(pm4, R_028644_SPI_INTERP_CONTROL_0,
+                     S_0286D4_FLAT_SHADE_ENA(1) | S_0286D4_PNT_SPRITE_ENA(1) |
+                        S_0286D4_PNT_SPRITE_OVRD_X(V_0286D4_SPI_PNT_SPRITE_SEL_S) |
+                        S_0286D4_PNT_SPRITE_OVRD_Y(V_0286D4_SPI_PNT_SPRITE_SEL_T) |
+                        S_0286D4_PNT_SPRITE_OVRD_Z(V_0286D4_SPI_PNT_SPRITE_SEL_0) |
+                        S_0286D4_PNT_SPRITE_OVRD_W(V_0286D4_SPI_PNT_SPRITE_SEL_1) |
+                        S_0286D4_PNT_SPRITE_TOP_1(0));
+   } else {
+      ac_pm4_set_reg(pm4, R_0286D4_SPI_INTERP_CONTROL_0,
+                     S_0286D4_FLAT_SHADE_ENA(1) | S_0286D4_PNT_SPRITE_ENA(1) |
+                        S_0286D4_PNT_SPRITE_OVRD_X(V_0286D4_SPI_PNT_SPRITE_SEL_S) |
+                        S_0286D4_PNT_SPRITE_OVRD_Y(V_0286D4_SPI_PNT_SPRITE_SEL_T) |
+                        S_0286D4_PNT_SPRITE_OVRD_Z(V_0286D4_SPI_PNT_SPRITE_SEL_0) |
+                        S_0286D4_PNT_SPRITE_OVRD_W(V_0286D4_SPI_PNT_SPRITE_SEL_1) |
+                        S_0286D4_PNT_SPRITE_TOP_1(0));
+   }
+
+   ac_pm4_set_reg(pm4, R_028BE4_PA_SU_VTX_CNTL,
+                  S_028BE4_PIX_CENTER(1) | S_028BE4_ROUND_MODE(V_028BE4_X_ROUND_TO_EVEN) |
+                     S_028BE4_QUANT_MODE(V_028BE4_X_16_8_FIXED_POINT_1_256TH));
+
+   if (info->gfx_level >= GFX12) {
+      ac_pm4_set_reg(pm4, R_028814_PA_CL_VTE_CNTL,
+                     S_028818_VTX_W0_FMT(1) | S_028818_VPORT_X_SCALE_ENA(1) | S_028818_VPORT_X_OFFSET_ENA(1) |
+                        S_028818_VPORT_Y_SCALE_ENA(1) | S_028818_VPORT_Y_OFFSET_ENA(1) | S_028818_VPORT_Z_SCALE_ENA(1) |
+                        S_028818_VPORT_Z_OFFSET_ENA(1));
+   } else {
+      ac_pm4_set_reg(pm4, R_028818_PA_CL_VTE_CNTL,
+                     S_028818_VTX_W0_FMT(1) | S_028818_VPORT_X_SCALE_ENA(1) | S_028818_VPORT_X_OFFSET_ENA(1) |
+                        S_028818_VPORT_Y_SCALE_ENA(1) | S_028818_VPORT_Y_OFFSET_ENA(1) | S_028818_VPORT_Z_SCALE_ENA(1) |
+                        S_028818_VPORT_Z_OFFSET_ENA(1));
+   }
+
+   ac_pm4_set_reg(pm4, R_028828_PA_SU_LINE_STIPPLE_SCALE, 0x3f800000);
+
+   if (info->gfx_level >= GFX12)
+      ac_pm4_set_reg(pm4, R_028000_DB_RENDER_CONTROL, 0);
+
+   if (info->family >= CHIP_NAVI31 && info->family <= CHIP_STRIX1)
+      ac_pm4_set_reg(pm4, R_028424_CB_FDCC_CONTROL, S_028424_DISABLE_CONSTANT_ENCODE_SINGLE(1));
+
+   ac_pm4_finalize(pm4);
+   assert(cmd->cs.cdw + pm4->ndw <= cmd->cs.max_dw);
+   ac_pm4_emit_commands(&cmd->cs, pm4);
+   ac_pm4_free_state(pm4);
+
+   command_emit_compute(cmd, false);
+}
+
 PUBLIC zgfx_command *command_begin(zgfx_device *dev) {
    zgfx_command* cmd = malloc(sizeof(zgfx_command));
    assert(cmd);
@@ -237,6 +347,8 @@ PUBLIC zgfx_command *command_begin(zgfx_device *dev) {
    cmd->ib_count = 1;
    cmd->ib_capacity = 8;
    cmd->dev = dev;
+
+   command_emit_graphics(cmd);
 
    return cmd;
 }
@@ -423,6 +535,9 @@ PUBLIC void command_clear(zgfx_command *cmd, void *backbuffer, uint32_t color, u
       remaining -= chunk;
    }
 }
+PUBLIC void command_set_compute_shader(zgfx_command *cmd, zgfx_shader* shader) {}
+PUBLIC void command_set_compute_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data) {}
+PUBLIC void command_dispatch(zgfx_command *cmd, int x, int y, int z) {}
 
 #define QUEUE_SUBMIT_FENCE_TIMEOUT_NS (10ull * 1000 * 1000 * 1000)
 PUBLIC void queue_submit(zgfx_device *dev, zgfx_command *cmd) {

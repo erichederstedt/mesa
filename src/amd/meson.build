@@ -12,7 +12,7 @@ if with_amd_vk or with_gallium_radeonsi or with_zero_graphics
   subdir('common')
 endif
 
-if with_amd_vk or with_gallium_radeonsi
+if with_amd_vk or with_gallium_radeonsi or with_zero_graphics
   if amd_with_llvm
     subdir('llvm')
   else
