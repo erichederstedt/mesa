@@ -42,6 +42,11 @@ void command_clear(zgfx_command *cmd, void *backbuffer, uint32_t color, uint64_t
 void command_set_compute_shader(zgfx_command *cmd, zgfx_shader* shader);
 void command_set_compute_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data);
 void command_dispatch(zgfx_command *cmd, int x, int y, int z);
+void command_set_vertex_shader(zgfx_command *cmd, zgfx_shader* shader);
+void command_set_vertex_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data);
+void command_set_pixel_shader(zgfx_command *cmd, zgfx_shader* shader);
+// void command_set_pixel_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data);
+void command_draw_indexed(zgfx_command *cmd, int x, int y, int z);
 
 void queue_submit(zgfx_device *dev, zgfx_command *cmd);
 
