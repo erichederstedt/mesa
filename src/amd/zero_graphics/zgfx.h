@@ -24,6 +24,14 @@ typedef enum zgfx_shader_type {
     ZGFX_SHADER_VERTEX,
     ZGFX_SHADER_PIXEL,
 } zgfx_shader_type;
+typedef struct zgfx_viewport {
+    float    x;
+    float    y;
+    float    width;
+    float    height;
+    float    minDepth;
+    float    maxDepth;
+} zgfx_viewport;
 
 zgfx_device *device_create(void);
 
@@ -47,6 +55,8 @@ void command_set_vertex_shader_args(zgfx_command *cmd, zgfx_shader* shader, void
 void command_set_pixel_shader(zgfx_command *cmd, zgfx_shader* shader);
 void command_set_pixel_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data);
 void command_draw(zgfx_command *cmd, int vertexCount);
+void command_set_viewport(zgfx_command *cmd, zgfx_viewport viewport); // just single view port for now
+void command_set_rendertarget(zgfx_command *cmd, void* rendertarget, uint64_t width, uint64_t height, zgfx_color_format format);
 
 void queue_submit(zgfx_device *dev, zgfx_command *cmd);
 

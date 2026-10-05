@@ -35,6 +35,8 @@ struct zgfx_command {
    uint64_t ib_capacity;
    zgfx_device* dev;
    zgfx_shader *compute_shader;
+   zgfx_shader *vertex_shader;
+   zgfx_shader *pixel_shader;
 };
 struct zgfx_shader {
    zgfx_device *dev;
@@ -52,6 +54,7 @@ struct zgfx_shader {
    uint32_t vs_param_exports;
    uint32_t spi_shader_pos_format;
    uint32_t spi_shader_col_format;
+   uint32_t db_shader_control;
 };
 
 static uint64_t find_buffer(struct zgfx_device *dev, void *ptr) {

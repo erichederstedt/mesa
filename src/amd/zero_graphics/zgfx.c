@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <unistd.h>
 
 #include "ac_linux_drm.h"
@@ -12,6 +13,10 @@
 #include "ac_cmdbuf_cp.h"
 #include "ac_pm4.h"
 #include "ac_shader_args.h"
+#include "ac_shader_util.h"
+#include "ac_descriptors.h"
+#include "ac_guardband.h"
+#include "ac_surface.h"
 #include "amd_family.h"
 #include "sid.h"
 #include "util/macros.h"
@@ -348,6 +353,8 @@ PUBLIC zgfx_command *command_begin(zgfx_device *dev) {
    cmd->ib_capacity = 8;
    cmd->dev = dev;
    cmd->compute_shader = NULL;
+   cmd->vertex_shader = NULL;
+   cmd->pixel_shader = NULL;
 
    command_emit_graphics(cmd);
 
@@ -636,6 +643,336 @@ PUBLIC void command_dispatch(zgfx_command *cmd, int x, int y, int z) {
    ac_cmdbuf_emit(z);
    ac_cmdbuf_emit(initiator);
    ac_cmdbuf_end();
+}
+
+PUBLIC void command_set_vertex_shader(zgfx_command *cmd, zgfx_shader *shader) {
+   assert(cmd && shader && cmd->dev == shader->dev);
+   assert(shader->type == ZGFX_SHADER_VERTEX);
+   assert(shader->code && !shader->config.scratch_bytes_per_wave);
+
+   const struct radeon_info *info = &cmd->dev->info;
+   assert(info->has_graphics && info->gfx_level < GFX11 && shader->wave_size == 64);
+   uint64_t va = (uint64_t)(uintptr_t)shader->code;
+   assert((va & 255) == 0);
+
+   struct ac_pm4_state pm4 = {0};
+   ac_pm4_clear_state(&pm4, info, false, false);
+   ac_pm4_set_reg(&pm4, R_00B120_SPI_SHADER_PGM_LO_VS, va >> 8);
+   ac_pm4_set_reg(&pm4, R_00B124_SPI_SHADER_PGM_HI_VS, S_00B124_MEM_BASE(va >> 40));
+   ac_pm4_set_reg(&pm4, R_00B128_SPI_SHADER_PGM_RSRC1_VS, shader->config.rsrc1);
+   ac_pm4_set_reg(&pm4, R_00B12C_SPI_SHADER_PGM_RSRC2_VS, shader->config.rsrc2);
+
+   unsigned out_config = S_0286C4_VS_EXPORT_COUNT(MAX2(shader->vs_param_exports, 1) - 1);
+   if (info->gfx_level >= GFX10)
+      out_config |= S_0286C4_NO_PC_EXPORT(shader->vs_param_exports == 0);
+   ac_pm4_set_reg(&pm4, R_0286C4_SPI_VS_OUT_CONFIG, out_config);
+   ac_pm4_set_reg(&pm4, R_02870C_SPI_SHADER_POS_FORMAT, shader->spi_shader_pos_format);
+   ac_pm4_set_reg(&pm4, R_02881C_PA_CL_VS_OUT_CNTL, 0);
+   ac_pm4_set_reg(&pm4, R_028B54_VGT_SHADER_STAGES_EN,
+                  info->gfx_level >= GFX9 ? S_028B54_MAX_PRIMGRP_IN_WAVE(2) : 0);
+   ac_pm4_set_reg(&pm4, R_028A40_VGT_GS_MODE, 0);
+   ac_pm4_set_reg(&pm4, R_028A84_VGT_PRIMITIVEID_EN, 0);
+   if (info->gfx_level <= GFX8)
+      ac_pm4_set_reg(&pm4, R_028AB4_VGT_REUSE_OFF, 0);
+
+   if (info->gfx_level >= GFX7) {
+      unsigned late_alloc_wave64, cu_mask;
+      ac_compute_late_alloc(info, false, false, false, &late_alloc_wave64, &cu_mask);
+      ac_pm4_set_reg(&pm4, R_00B118_SPI_SHADER_PGM_RSRC3_VS,
+                     ac_apply_cu_en(S_00B118_CU_EN(cu_mask) | S_00B118_WAVE_LIMIT(0x3f),
+                                    C_00B118_CU_EN, 0, info));
+      ac_pm4_set_reg(&pm4, R_00B11C_SPI_SHADER_LATE_ALLOC_VS, S_00B11C_LIMIT(late_alloc_wave64));
+      if (info->gfx_level >= GFX10) {
+         unsigned pc_lines = late_alloc_wave64 ? info->pc_lines / 4 : 0;
+         ac_pm4_set_reg(&pm4, R_030980_GE_PC_ALLOC,
+                        S_030980_OVERSUB_EN(pc_lines > 0) | S_030980_NUM_PC_LINES(pc_lines - 1));
+      }
+   }
+
+   ac_pm4_finalize(&pm4);
+   if (cmd->cs.cdw + pm4.ndw > cmd->cs.max_dw)
+      command_grow(cmd);
+   ac_pm4_emit_commands(&cmd->cs, &pm4);
+   cmd->vertex_shader = shader;
+}
+
+static void command_set_graphics_shader_args(zgfx_command *cmd, zgfx_shader *shader,
+                                             void *data, zgfx_shader_type type) {
+   assert(cmd && shader && cmd->dev == shader->dev && shader->type == type);
+   assert(shader->argument_ptr.used && cmd->dev->info.gfx_level < GFX11);
+
+   unsigned offset = type == ZGFX_SHADER_VERTEX ? R_00B130_SPI_SHADER_USER_DATA_VS_0 :
+                                                R_00B030_SPI_SHADER_USER_DATA_PS_0;
+   offset += shader->args.args[shader->argument_ptr.arg_index].offset * 4;
+   uint64_t va = (uint64_t)(uintptr_t)data;
+   struct ac_pm4_state pm4 = {0};
+   ac_pm4_clear_state(&pm4, &cmd->dev->info, false, false);
+   ac_pm4_set_reg(&pm4, offset, va);
+   ac_pm4_set_reg(&pm4, offset + 4, va >> 32);
+   ac_pm4_finalize(&pm4);
+   if (cmd->cs.cdw + pm4.ndw > cmd->cs.max_dw)
+      command_grow(cmd);
+   ac_pm4_emit_commands(&cmd->cs, &pm4);
+}
+
+PUBLIC void command_set_vertex_shader_args(zgfx_command *cmd, zgfx_shader *shader, void *data) {
+   command_set_graphics_shader_args(cmd, shader, data, ZGFX_SHADER_VERTEX);
+}
+
+PUBLIC void command_set_pixel_shader(zgfx_command *cmd, zgfx_shader *shader) {
+   assert(cmd && shader && cmd->dev == shader->dev);
+   assert(shader->type == ZGFX_SHADER_PIXEL);
+   assert(shader->code && !shader->config.scratch_bytes_per_wave);
+
+   const struct radeon_info *info = &cmd->dev->info;
+   assert(info->has_graphics && info->gfx_level < GFX11 && shader->wave_size == 64);
+   uint64_t va = (uint64_t)(uintptr_t)shader->code;
+   assert((va & 255) == 0);
+
+   struct ac_pm4_state pm4 = {0};
+   ac_pm4_clear_state(&pm4, info, false, false);
+   ac_pm4_set_reg(&pm4, R_00B020_SPI_SHADER_PGM_LO_PS, va >> 8);
+   ac_pm4_set_reg(&pm4, R_00B024_SPI_SHADER_PGM_HI_PS, S_00B024_MEM_BASE(va >> 40));
+   ac_pm4_set_reg(&pm4, R_00B028_SPI_SHADER_PGM_RSRC1_PS, shader->config.rsrc1);
+   ac_pm4_set_reg(&pm4, R_00B02C_SPI_SHADER_PGM_RSRC2_PS, shader->config.rsrc2);
+   ac_pm4_set_reg(&pm4, R_0286CC_SPI_PS_INPUT_ENA, shader->config.spi_ps_input_ena);
+   ac_pm4_set_reg(&pm4, R_0286D0_SPI_PS_INPUT_ADDR, shader->config.spi_ps_input_addr);
+   ac_pm4_set_reg(&pm4, R_0286D8_SPI_PS_IN_CONTROL, 0);
+   ac_pm4_set_reg(&pm4, R_028710_SPI_SHADER_Z_FORMAT, 0);
+   ac_pm4_set_reg(&pm4, R_028714_SPI_SHADER_COL_FORMAT, shader->spi_shader_col_format);
+   ac_pm4_set_reg(&pm4, R_02823C_CB_SHADER_MASK, 0xf);
+   ac_pm4_set_reg(&pm4, R_02880C_DB_SHADER_CONTROL, shader->db_shader_control);
+   if (info->gfx_level >= GFX9)
+      ac_pm4_set_reg(&pm4, R_028C40_PA_SC_SHADER_CONTROL, 0);
+
+   ac_pm4_finalize(&pm4);
+   if (cmd->cs.cdw + pm4.ndw > cmd->cs.max_dw)
+      command_grow(cmd);
+   ac_pm4_emit_commands(&cmd->cs, &pm4);
+   cmd->pixel_shader = shader;
+}
+
+PUBLIC void command_set_pixel_shader_args(zgfx_command *cmd, zgfx_shader *shader, void *data) {
+   command_set_graphics_shader_args(cmd, shader, data, ZGFX_SHADER_PIXEL);
+}
+
+PUBLIC void command_draw(zgfx_command *cmd, int vertexCount) {
+   assert(cmd && vertexCount >= 0);
+   if (!vertexCount)
+      return;
+   assert(cmd->vertex_shader && cmd->pixel_shader);
+
+   const struct radeon_info *info = &cmd->dev->info;
+   const zgfx_shader *vs = cmd->vertex_shader;
+   assert(info->has_graphics && info->gfx_level < GFX11 && vs->args.base_vertex.used);
+   struct ac_pm4_state pm4 = {0};
+   ac_pm4_clear_state(&pm4, info, false, false);
+   ac_pm4_set_reg(&pm4, R_00B130_SPI_SHADER_USER_DATA_VS_0 +
+                  vs->args.args[vs->args.base_vertex.arg_index].offset * 4, 0);
+   if (info->gfx_level >= GFX10) {
+      ac_pm4_set_reg(&pm4, R_03096C_GE_CNTL,
+                     S_03096C_PRIM_GRP_SIZE_GFX10(128) | S_03096C_VERT_GRP_SIZE(256));
+   }
+   ac_pm4_finalize(&pm4);
+
+   if (cmd->cs.cdw + pm4.ndw + 11 > cmd->cs.max_dw)
+      command_grow(cmd);
+   ac_pm4_emit_commands(&cmd->cs, &pm4);
+
+   ac_cmdbuf_begin(&cmd->cs);
+   if (info->gfx_level >= GFX7)
+      ac_cmdbuf_set_ucfg_reg_idx(info, R_030908_VGT_PRIMITIVE_TYPE, 1, V_008958_DI_PT_TRILIST);
+   else
+      ac_cmdbuf_set_cfg_reg(R_008958_VGT_PRIMITIVE_TYPE, V_008958_DI_PT_TRILIST);
+
+   if (info->gfx_level < GFX10) {
+      bool switch_on_eoi = info->gfx_level >= GFX7 && info->max_se >= 4;
+      unsigned ia_multi_vgt_param = S_028AA8_PRIMGROUP_SIZE(127) |
+         S_028AA8_MAX_PRIMGRP_IN_WAVE(info->gfx_level == GFX8 ? 2 : 0) |
+         S_028AA8_WD_SWITCH_ON_EOP(info->gfx_level >= GFX7 && info->max_se < 4) |
+         S_028AA8_SWITCH_ON_EOI(switch_on_eoi) |
+         S_028AA8_PARTIAL_ES_WAVE_ON(info->gfx_level <= GFX8 && switch_on_eoi) |
+         S_028AA8_PARTIAL_VS_WAVE_ON(info->family == CHIP_HAWAII && switch_on_eoi) |
+         S_030960_EN_INST_OPT_BASIC(info->gfx_level >= GFX9) |
+         S_030960_EN_INST_OPT_ADV(info->gfx_level >= GFX9);
+      if (info->gfx_level == GFX9)
+         ac_cmdbuf_set_ucfg_reg_idx(info, R_030960_IA_MULTI_VGT_PARAM, 4, ia_multi_vgt_param);
+      else if (info->gfx_level >= GFX7)
+         ac_cmdbuf_set_ctx_reg_idx(R_028AA8_IA_MULTI_VGT_PARAM, 1, ia_multi_vgt_param);
+      else
+         ac_cmdbuf_set_ctx_reg(R_028AA8_IA_MULTI_VGT_PARAM, ia_multi_vgt_param);
+   }
+   ac_cmdbuf_emit(PKT3(PKT3_NUM_INSTANCES, 0, 0));
+   ac_cmdbuf_emit(1);
+   ac_cmdbuf_emit(PKT3(PKT3_DRAW_INDEX_AUTO, 1, 0));
+   ac_cmdbuf_emit(vertexCount);
+   ac_cmdbuf_emit(V_0287F0_DI_SRC_SEL_AUTO_INDEX);
+   ac_cmdbuf_end();
+}
+
+PUBLIC void command_set_viewport(zgfx_command *cmd, zgfx_viewport viewport) {
+   assert(cmd && cmd->dev->info.gfx_level < GFX11);
+   assert(isfinite(viewport.x) && isfinite(viewport.y) &&
+          isfinite(viewport.width) && isfinite(viewport.height));
+   assert(viewport.width > 0 && viewport.height != 0);
+   assert(viewport.minDepth >= 0 && viewport.minDepth <= 1 &&
+          viewport.maxDepth >= 0 && viewport.maxDepth <= 1);
+   float miny = MIN2(viewport.y, viewport.y + viewport.height);
+   float maxy = MAX2(viewport.y, viewport.y + viewport.height);
+   assert(viewport.x >= -32768 && viewport.x + viewport.width <= 32767 &&
+          miny >= -32768 && maxy <= 32767);
+
+   struct ac_guardband guardband;
+   ac_compute_guardband(&cmd->dev->info, floorf(viewport.x), floorf(miny),
+                         ceilf(viewport.x + viewport.width), ceilf(maxy),
+                         AC_QUANT_MODE_16_8_FIXED_POINT_1_256TH, 0, &guardband);
+   struct ac_pm4_state pm4 = {0};
+   ac_pm4_clear_state(&pm4, &cmd->dev->info, false, false);
+   ac_pm4_set_reg(&pm4, R_02843C_PA_CL_VPORT_XSCALE, fui(viewport.width * 0.5f));
+   ac_pm4_set_reg(&pm4, R_028440_PA_CL_VPORT_XOFFSET, fui(viewport.x + viewport.width * 0.5f));
+   ac_pm4_set_reg(&pm4, R_028444_PA_CL_VPORT_YSCALE, fui(viewport.height * 0.5f));
+   ac_pm4_set_reg(&pm4, R_028448_PA_CL_VPORT_YOFFSET, fui(viewport.y + viewport.height * 0.5f));
+   ac_pm4_set_reg(&pm4, R_02844C_PA_CL_VPORT_ZSCALE, fui(viewport.maxDepth - viewport.minDepth));
+   ac_pm4_set_reg(&pm4, R_028450_PA_CL_VPORT_ZOFFSET, fui(viewport.minDepth));
+   ac_pm4_set_reg(&pm4, R_0282D0_PA_SC_VPORT_ZMIN_0, fui(MIN2(viewport.minDepth, viewport.maxDepth)));
+   ac_pm4_set_reg(&pm4, R_0282D4_PA_SC_VPORT_ZMAX_0, fui(MAX2(viewport.minDepth, viewport.maxDepth)));
+   ac_pm4_set_reg(&pm4, R_028BE8_PA_CL_GB_VERT_CLIP_ADJ, fui(guardband.clip_y));
+   ac_pm4_set_reg(&pm4, R_028BEC_PA_CL_GB_VERT_DISC_ADJ, fui(guardband.discard_y));
+   ac_pm4_set_reg(&pm4, R_028BF0_PA_CL_GB_HORZ_CLIP_ADJ, fui(guardband.clip_x));
+   ac_pm4_set_reg(&pm4, R_028BF4_PA_CL_GB_HORZ_DISC_ADJ, fui(guardband.discard_x));
+   ac_pm4_set_reg(&pm4, R_028234_PA_SU_HARDWARE_SCREEN_OFFSET,
+                  S_028234_HW_SCREEN_OFFSET_X(guardband.hw_screen_offset_x >> 4) |
+                  S_028234_HW_SCREEN_OFFSET_Y(guardband.hw_screen_offset_y >> 4));
+   ac_pm4_finalize(&pm4);
+   if (cmd->cs.cdw + pm4.ndw > cmd->cs.max_dw)
+      command_grow(cmd);
+   ac_pm4_emit_commands(&cmd->cs, &pm4);
+}
+
+PUBLIC void command_set_rendertarget(zgfx_command *cmd, void *rendertarget,
+                                    uint64_t width, uint64_t height, zgfx_color_format format) {
+   assert(cmd && rendertarget && width && height && width <= 16384 && height <= 16384);
+   assert(format == ZGFX_COLOR_RGBA8_UNORM || format == ZGFX_COLOR_RGBA32_FLOAT);
+   const struct radeon_info *info = &cmd->dev->info;
+   assert(info->has_graphics && info->gfx_level < GFX11);
+   uint64_t va = (uint64_t)(uintptr_t)rendertarget;
+   assert((va & 255) == 0);
+   unsigned bpe = format_bit_size(format) / 8;
+   unsigned pitch = align(width * bpe, 256) / bpe;
+   uint64_t buffer_index = find_buffer(cmd->dev, rendertarget);
+   assert(buffer_index != UINT64_MAX && cmd->dev->buffers_size[buffer_index] >= (uint64_t)pitch * height * bpe);
+
+   struct radeon_surf surf = {0};
+   surf.bpe = bpe;
+   surf.blk_w = surf.blk_h = 1;
+   surf.is_linear = true;
+   if (info->gfx_level >= GFX9) {
+      surf.u.gfx9.resource_type = RADEON_RESOURCE_2D;
+      surf.u.gfx9.surf_pitch = pitch;
+      surf.u.gfx9.epitch = pitch - 1;
+      surf.u.gfx9.uses_custom_pitch = info->gfx_level >= GFX10_3;
+   } else {
+      assert(va >> 40 == 0 && ((uint64_t)pitch * height) % 64 == 0);
+      surf.u.legacy.bankh = 1;
+      surf.u.legacy.tiling_index[0] = 8;
+      surf.u.legacy.level[0].mode = RADEON_SURF_MODE_LINEAR_ALIGNED;
+      surf.u.legacy.level[0].nblk_x = pitch;
+      surf.u.legacy.level[0].nblk_y = height;
+   }
+   struct ac_cb_surface cb = {0};
+   ac_init_cb_surface(info, &(struct ac_cb_state){
+      .surf = &surf,
+      .format = format == ZGFX_COLOR_RGBA8_UNORM ? PIPE_FORMAT_R8G8B8A8_UNORM : PIPE_FORMAT_R32G32B32A32_FLOAT,
+      .width = width, .height = height,
+      .num_layers = 0, .num_samples = 1, .num_storage_samples = 1, .num_levels = 1,
+   }, &cb);
+   struct ac_cb_surface base_cb = cb;
+   ac_set_mutable_cb_surface_fields(info, &(struct ac_mutable_cb_state){
+      .surf = &surf, .cb = &base_cb, .va = va, .num_samples = 1,
+   }, &cb);
+
+   struct ac_pm4_state *pm4 = ac_pm4_create_sized(info, false, 256, false);
+   assert(pm4);
+   ac_pm4_set_reg(pm4, R_028C60_CB_COLOR0_BASE, cb.cb_color_base);
+   ac_pm4_set_reg(pm4, R_028C64_CB_COLOR0_PITCH,
+                  info->gfx_level == GFX9 ? S_028C64_BASE_256B(cb.cb_color_base >> 32) : cb.cb_color_pitch);
+   ac_pm4_set_reg(pm4, R_028C68_CB_COLOR0_SLICE,
+                  info->gfx_level == GFX9 ? cb.cb_color_attrib2 : cb.cb_color_slice);
+   ac_pm4_set_reg(pm4, R_028C6C_CB_COLOR0_VIEW, cb.cb_color_view);
+   ac_pm4_set_reg(pm4, R_028C70_CB_COLOR0_INFO, cb.cb_color_info);
+   ac_pm4_set_reg(pm4, R_028C74_CB_COLOR0_ATTRIB, cb.cb_color_attrib);
+   if (info->gfx_level >= GFX8)
+      ac_pm4_set_reg(pm4, R_028C78_CB_COLOR0_DCC_CONTROL, cb.cb_dcc_control);
+   ac_pm4_set_reg(pm4, R_028C7C_CB_COLOR0_CMASK, cb.cb_color_cmask);
+   ac_pm4_set_reg(pm4, R_028C80_CB_COLOR0_CMASK_SLICE,
+                  info->gfx_level == GFX9 ? S_028C80_BASE_256B(cb.cb_color_cmask >> 32) : cb.cb_color_cmask_slice);
+   ac_pm4_set_reg(pm4, R_028C84_CB_COLOR0_FMASK, cb.cb_color_fmask);
+   ac_pm4_set_reg(pm4, R_028C88_CB_COLOR0_FMASK_SLICE,
+                  info->gfx_level == GFX9 ? S_028C88_BASE_256B(cb.cb_color_fmask >> 32) : cb.cb_color_fmask_slice);
+   if (info->gfx_level >= GFX8)
+      ac_pm4_set_reg(pm4, R_028C94_CB_COLOR0_DCC_BASE, 0);
+   if (info->gfx_level == GFX9) {
+      ac_pm4_set_reg(pm4, R_028C98_CB_COLOR0_DCC_BASE_EXT, 0);
+      ac_pm4_set_reg(pm4, R_0287A0_CB_MRT0_EPITCH, cb.cb_mrt_epitch);
+   } else if (info->gfx_level >= GFX10) {
+      ac_pm4_set_reg(pm4, R_028E40_CB_COLOR0_BASE_EXT, S_028E40_BASE_256B(cb.cb_color_base >> 32));
+      ac_pm4_set_reg(pm4, R_028E60_CB_COLOR0_CMASK_BASE_EXT, S_028E60_BASE_256B(cb.cb_color_cmask >> 32));
+      ac_pm4_set_reg(pm4, R_028E80_CB_COLOR0_FMASK_BASE_EXT, S_028E80_BASE_256B(cb.cb_color_fmask >> 32));
+      ac_pm4_set_reg(pm4, R_028EA0_CB_COLOR0_DCC_BASE_EXT, 0);
+      ac_pm4_set_reg(pm4, R_028EC0_CB_COLOR0_ATTRIB2, cb.cb_color_attrib2);
+      ac_pm4_set_reg(pm4, R_028EE0_CB_COLOR0_ATTRIB3, cb.cb_color_attrib3);
+   }
+   ac_pm4_set_reg(pm4, R_028238_CB_TARGET_MASK, 0xf);
+   ac_pm4_set_reg(pm4, R_028808_CB_COLOR_CONTROL, S_028808_MODE(V_028808_CB_NORMAL) | S_028808_ROP3(0xcc));
+   ac_pm4_set_reg(pm4, R_028780_CB_BLEND0_CONTROL, 0);
+   if (info->has_rbplus) {
+      ac_pm4_set_reg(pm4, R_028754_SX_PS_DOWNCONVERT, 0);
+      ac_pm4_set_reg(pm4, R_028758_SX_BLEND_OPT_EPSILON, 0);
+      ac_pm4_set_reg(pm4, R_02875C_SX_BLEND_OPT_CONTROL, 0);
+   }
+   ac_pm4_set_reg(pm4, R_028800_DB_DEPTH_CONTROL, 0);
+   ac_pm4_set_reg(pm4, R_028000_DB_RENDER_CONTROL, 0);
+   ac_pm4_set_reg(pm4, R_028038_DB_Z_INFO, 0);
+   ac_pm4_set_reg(pm4, R_02803C_DB_STENCIL_INFO, 0);
+   ac_pm4_set_reg(pm4, R_028810_PA_CL_CLIP_CNTL, S_028810_DX_CLIP_SPACE_DEF(1));
+   ac_pm4_set_reg(pm4, R_028814_PA_SU_SC_MODE_CNTL, S_028814_FACE(1));
+   ac_pm4_set_reg(pm4, R_028A6C_VGT_GS_OUT_PRIM_TYPE, V_028A6C_TRISTRIP);
+   ac_pm4_set_reg(pm4, R_028A48_PA_SC_MODE_CNTL_0, S_028A48_VPORT_SCISSOR_ENABLE(1));
+   ac_pm4_set_reg(pm4, R_028A4C_PA_SC_MODE_CNTL_1,
+                  S_028A4C_WALK_FENCE_ENABLE(1) | S_028A4C_WALK_FENCE_SIZE(info->num_tile_pipes == 2 ? 2 : 3) |
+                  S_028A4C_OUT_OF_ORDER_WATER_MARK(7) | S_028A4C_SUPERTILE_WALK_ORDER_ENABLE(1) |
+                  S_028A4C_TILE_WALK_ORDER_ENABLE(1) | S_028A4C_MULTI_SHADER_ENGINE_PRIM_DISCARD_ENABLE(1) |
+                  S_028A4C_FORCE_EOV_CNTDWN_ENABLE(1) | S_028A4C_FORCE_EOV_REZ_ENABLE(1) |
+                  S_028A4C_WALK_ALIGN8_PRIM_FITS_ST(1));
+   ac_pm4_set_reg(pm4, R_028BE0_PA_SC_AA_CONFIG, 0);
+   ac_pm4_set_reg(pm4, R_028C38_PA_SC_AA_MASK_X0Y0_X1Y0, UINT32_MAX);
+   ac_pm4_set_reg(pm4, R_028C3C_PA_SC_AA_MASK_X0Y1_X1Y1, UINT32_MAX);
+   ac_pm4_set_reg(pm4, R_0286E0_SPI_BARYC_CNTL, 0);
+   ac_pm4_set_reg(pm4, R_028BD4_PA_SC_CENTROID_PRIORITY_0, 0);
+   ac_pm4_set_reg(pm4, R_028BD8_PA_SC_CENTROID_PRIORITY_1, 0);
+   for (unsigned i = 0; i < 4; i++)
+      ac_pm4_set_reg(pm4, R_028BF8_PA_SC_AA_SAMPLE_LOCS_PIXEL_X0Y0_0 + i * 16, 0);
+   if (info->gfx_level >= GFX9) {
+      unsigned binning = S_028C44_BINNING_MODE(V_028C44_BINNING_DISABLED) |
+                          S_028C44_DISABLE_START_OF_PRIM(1) | S_028C44_FLUSH_ON_BINNING_TRANSITION(1);
+      if (info->gfx_level >= GFX10)
+         binning |= S_028C44_BIN_SIZE_X_EXTEND(2) | S_028C44_BIN_SIZE_Y_EXTEND(bpe <= 4 ? 2 : 1);
+      ac_pm4_set_reg(pm4, R_028C44_PA_SC_BINNER_CNTL_0, binning);
+   }
+   unsigned br = S_028034_BR_X(width) | S_028034_BR_Y(height);
+   ac_pm4_set_reg(pm4, R_028030_PA_SC_SCREEN_SCISSOR_TL, 0);
+   ac_pm4_set_reg(pm4, R_028034_PA_SC_SCREEN_SCISSOR_BR, br);
+   ac_pm4_set_reg(pm4, R_028204_PA_SC_WINDOW_SCISSOR_TL, S_028204_WINDOW_OFFSET_DISABLE(1));
+   ac_pm4_set_reg(pm4, R_028208_PA_SC_WINDOW_SCISSOR_BR, br);
+   ac_pm4_set_reg(pm4, R_028240_PA_SC_GENERIC_SCISSOR_TL, S_028240_WINDOW_OFFSET_DISABLE(1));
+   ac_pm4_set_reg(pm4, R_028244_PA_SC_GENERIC_SCISSOR_BR, br);
+   ac_pm4_set_reg(pm4, R_028250_PA_SC_VPORT_SCISSOR_0_TL, S_028250_WINDOW_OFFSET_DISABLE(1));
+   ac_pm4_set_reg(pm4, R_028254_PA_SC_VPORT_SCISSOR_0_BR, br);
+   ac_pm4_finalize(pm4);
+   if (cmd->cs.cdw + pm4->ndw > cmd->cs.max_dw)
+      command_grow(cmd);
+   ac_pm4_emit_commands(&cmd->cs, pm4);
+   ac_pm4_free_state(pm4);
 }
 
 #define QUEUE_SUBMIT_FENCE_TIMEOUT_NS (10ull * 1000 * 1000 * 1000)

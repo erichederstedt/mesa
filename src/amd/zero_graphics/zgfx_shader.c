@@ -163,6 +163,15 @@ static bool shader_lower_graphics_io(nir_shader *nir, zgfx_shader *shader)
          return false;
       }
       shader->spi_shader_col_format = V_028714_SPI_SHADER_32_ABGR;
+      shader->db_shader_control =
+         S_02880C_KILL_ENABLE(nir->info.fs.uses_discard) |
+         S_02880C_CONSERVATIVE_Z_EXPORT(V_02880C_EXPORT_ANY_Z) |
+         S_02880C_Z_ORDER(nir->info.fs.early_fragment_tests || !nir->info.writes_memory ?
+                         V_02880C_EARLY_Z_THEN_LATE_Z : V_02880C_LATE_Z) |
+         S_02880C_DEPTH_BEFORE_SHADER(nir->info.fs.early_fragment_tests) |
+         S_02880C_EXEC_ON_HIER_FAIL(nir->info.writes_memory) |
+         S_02880C_EXEC_ON_NOOP(nir->info.writes_memory) |
+         S_02880C_DUAL_QUAD_DISABLE(shader->dev->info.has_rbplus && !shader->dev->info.rbplus_allowed);
       NIR_PASS(_, nir, ac_nir_lower_ps_late, &(ac_nir_lower_ps_late_options){
          .gfx_level = shader->dev->info.gfx_level,
          .use_aco = true,

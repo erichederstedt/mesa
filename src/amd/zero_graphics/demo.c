@@ -8,24 +8,24 @@ typedef struct float2 {
    float x, y;
 } float2;
 typedef union float3 {
-   struct {
-      float2 xy;
-   };
    struct
    {
       float x, y, z;
    };
-} float3;
-typedef union float4 {
    struct {
       float2 xy;
+   };
+} float3;
+typedef union float4 {
+   struct
+   {
+      float x, y, z, w;
    };
    struct {
       float3 xyz;
    };
-   struct
-   {
-      float x, y, z, w;
+   struct {
+      float2 xy;
    };
 } float4;
 
@@ -74,9 +74,20 @@ int main(void) {
       float2 uv;
    } Vertex;
    Vertex* vertices = galloc(dev, sizeof(Vertex) * 3);
-   // Fill in vert data
+   vertices[0].position = (float3){-0.5, -0.5, 0.0};
+   //vertices[0].color = (float4){-0.5, -0.5, 0.0, 1.0};
+   //vertices[0].color = (float4){1.0, 0.0, 0.0, 1.0};
+   vertices[1].position = (float3){0.5, -0.5, 0.0};
+   //vertices[1].color = (float4){0.5, -0.5, 0.0, 1.0};
+   //vertices[1].color = (float4){0.0, 1.0, 0.0, 1.0};
+   vertices[2].position = (float3){0.0, 0.5, 0.0};
+   //vertices[2].color = (float4){0.0, 0.5, 0.0, 1.0};
+   //vertices[2].color = (float4){0.0, 0.0, 1.0, 1.0};
    float4* triColor = galloc(dev, sizeof(float4));
-   // Pick triangle color
+   triColor->x = 1.0;
+   triColor->y = 0.0;
+   triColor->z = 0.0;
+   triColor->w = 1.0;
    zgfx_shader* vs_shader = shader_create(dev, demo_triangle_spv, demo_triangle_spv_len, ZGFX_SHADER_VERTEX, "vertexMain");
    zgfx_shader* ps_shader = shader_create(dev, demo_triangle_spv, demo_triangle_spv_len, ZGFX_SHADER_PIXEL, "fragmentMain");
    void *backbuffer = galloct(dev, 1024, 1024, ZGFX_COLOR_RGBA8_UNORM, 1, 1);
