@@ -9,6 +9,7 @@
 #include "ac_cmdbuf.h"
 #include "ac_gpu_info.h"
 #include "ac_shader_args.h"
+#include "compiler/shader_enums.h"
 
 #define MAX_BUFFER_COUNT 128
 struct zgfx_device {
@@ -37,6 +38,7 @@ struct zgfx_command {
 };
 struct zgfx_shader {
    zgfx_device *dev;
+   zgfx_shader_type type;
    void *code;
    uint32_t code_size;
    uint32_t exec_size;
@@ -46,6 +48,10 @@ struct zgfx_shader {
    uint32_t num_user_sgprs;
    struct ac_shader_args args;
    struct ac_arg argument_ptr;
+   uint8_t vs_param_offsets[NUM_TOTAL_VARYING_SLOTS];
+   uint32_t vs_param_exports;
+   uint32_t spi_shader_pos_format;
+   uint32_t spi_shader_col_format;
 };
 
 static uint64_t find_buffer(struct zgfx_device *dev, void *ptr) {

@@ -21,8 +21,8 @@ typedef enum zgfx_color_format {
 typedef enum zgfx_shader_type {
     ZGFX_SHADER_UNKOWN,
     ZGFX_SHADER_COMPUTE,
-    ZGFX_SHADER_VERTEX, // not implemented
-    ZGFX_SHADER_PIXEL, // not implemented
+    ZGFX_SHADER_VERTEX,
+    ZGFX_SHADER_PIXEL,
 } zgfx_shader_type;
 
 zgfx_device *device_create(void);
@@ -45,8 +45,8 @@ void command_dispatch(zgfx_command *cmd, int x, int y, int z);
 void command_set_vertex_shader(zgfx_command *cmd, zgfx_shader* shader);
 void command_set_vertex_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data);
 void command_set_pixel_shader(zgfx_command *cmd, zgfx_shader* shader);
-// void command_set_pixel_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data);
-void command_draw_indexed(zgfx_command *cmd, int x, int y, int z);
+void command_set_pixel_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data);
+void command_draw(zgfx_command *cmd, int vertexCount);
 
 void queue_submit(zgfx_device *dev, zgfx_command *cmd);
 

@@ -109,18 +109,92 @@ static void shader_build_binary(void **data, const aco_callback_params *params)
    shader->wave_size = params->wave_size;
 }
 
+static unsigned shader_io_size(const struct glsl_type *type, bool bindless)
+{
+   return glsl_count_attribute_slots(type, false);
+}
+
+static bool shader_lower_graphics_io(nir_shader *nir, zgfx_shader *shader)
+{
+   NIR_PASS(_, nir, nir_lower_array_deref_of_vec, nir_var_shader_in | nir_var_shader_out, NULL,
+            nir_lower_direct_array_deref_of_vec_load | nir_lower_indirect_array_deref_of_vec_load |
+            nir_lower_direct_array_deref_of_vec_store | nir_lower_indirect_array_deref_of_vec_store);
+   nir_assign_io_var_locations(nir, nir_var_shader_in);
+   nir_assign_io_var_locations(nir, nir_var_shader_out);
+   NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out, shader_io_size,
+            nir_lower_io_lower_64bit_to_32 | nir_lower_io_use_interpolated_input_intrinsics);
+   nir->info.io_lowered = true;
+   NIR_PASS(_, nir, nir_opt_constant_folding);
+   NIR_PASS(_, nir, nir_opt_dce);
+   NIR_PASS(_, nir, nir_remove_dead_variables, nir_var_shader_in | nir_var_shader_out, NULL);
+   nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
+
+   if (nir->info.inputs_read) {
+      fprintf(stderr, "zgfx: graphics shader inputs are not supported yet; use physical pointers\n");
+      return false;
+   }
+   unsigned sysval;
+   BITSET_FOREACH_SET(sysval, nir->info.system_values_read, SYSTEM_VALUE_MAX) {
+      if (nir->info.stage == MESA_SHADER_VERTEX &&
+          (sysval == SYSTEM_VALUE_VERTEX_ID_ZERO_BASE || sysval == SYSTEM_VALUE_FIRST_VERTEX))
+         continue;
+      fprintf(stderr, "zgfx: unsupported graphics system value %u\n", sysval);
+      return false;
+   }
+
+   if (nir->info.stage == MESA_SHADER_VERTEX) {
+      if (!(nir->info.outputs_written & VARYING_BIT_POS) ||
+          (nir->info.outputs_written & ~(VARYING_BIT_POS | (BITFIELD64_MASK(32) << VARYING_SLOT_VAR0))) ||
+          nir->info.outputs_written_16bit) {
+         fprintf(stderr, "zgfx: vertex shaders require position and support location 0-31 outputs\n");
+         return false;
+      }
+      memset(shader->vs_param_offsets, AC_EXP_PARAM_UNDEFINED, sizeof(shader->vs_param_offsets));
+      for (unsigned slot = VARYING_SLOT_VAR0; slot <= VARYING_SLOT_VAR31; slot++) {
+         if (nir->info.outputs_written & BITFIELD64_BIT(slot))
+            shader->vs_param_offsets[slot] = shader->vs_param_exports++;
+      }
+      shader->spi_shader_pos_format = S_02870C_POS0_EXPORT_FORMAT(V_02870C_SPI_SHADER_4COMP);
+      NIR_PASS(_, nir, ac_nir_lower_legacy_vs, shader->dev->info.gfx_level, 0, false,
+               shader->vs_param_offsets, shader->vs_param_exports != 0, false, true, false);
+   } else {
+      if (nir->info.outputs_written != BITFIELD64_BIT(FRAG_RESULT_DATA0)) {
+         fprintf(stderr, "zgfx: pixel shaders currently require a single color output at location 0\n");
+         return false;
+      }
+      shader->spi_shader_col_format = V_028714_SPI_SHADER_32_ABGR;
+      NIR_PASS(_, nir, ac_nir_lower_ps_late, &(ac_nir_lower_ps_late_options){
+         .gfx_level = shader->dev->info.gfx_level,
+         .use_aco = true,
+         .uses_discard = nir->info.fs.uses_discard,
+         .spi_shader_col_format = shader->spi_shader_col_format,
+      });
+   }
+   return true;
+}
+
 PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
                                   uint64_t spriv_size, zgfx_shader_type shader_type, char *entry)
 {
    if (!dev || !spriv_bytes || spriv_size < 20 || spriv_size > SIZE_MAX ||
-       spriv_size % 4 || !entry || !*entry || shader_type != ZGFX_SHADER_COMPUTE) {
-      fprintf(stderr, "zgfx: shader_create requires compute SPIR-V and an entry point\n");
+       spriv_size % 4 || !entry || !*entry ||
+       (shader_type != ZGFX_SHADER_COMPUTE && shader_type != ZGFX_SHADER_VERTEX &&
+        shader_type != ZGFX_SHADER_PIXEL)) {
+      fprintf(stderr, "zgfx: shader_create requires SPIR-V, a supported stage and an entry point\n");
       return NULL;
    }
    if (!aco_is_gpu_supported(&dev->info)) {
       fprintf(stderr, "zgfx: GPU is not supported by ACO\n");
       return NULL;
    }
+   if (shader_type != ZGFX_SHADER_COMPUTE && dev->info.gfx_level >= GFX11) {
+      fprintf(stderr, "zgfx: graphics shaders currently require GFX6-GFX10.3\n");
+      return NULL;
+   }
+   mesa_shader_stage stage = shader_type == ZGFX_SHADER_COMPUTE ? MESA_SHADER_COMPUTE :
+                             shader_type == ZGFX_SHADER_VERTEX ? MESA_SHADER_VERTEX : MESA_SHADER_FRAGMENT;
+   enum ac_hw_stage hw_stage = shader_type == ZGFX_SHADER_COMPUTE ? AC_HW_COMPUTE_SHADER :
+                              shader_type == ZGFX_SHADER_VERTEX ? AC_HW_VERTEX_SHADER : AC_HW_PIXEL_SHADER;
 
    uint32_t *words = malloc(spriv_size);
    if (!words)
@@ -155,7 +229,7 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
       .debug.func = shader_spirv_message,
    };
    glsl_type_singleton_init_or_ref();
-   nir_shader *nir = spirv_to_nir(words, spriv_size / 4, NULL, MESA_SHADER_COMPUTE,
+   nir_shader *nir = spirv_to_nir(words, spriv_size / 4, NULL, stage,
                                   entry, &spirv_options, &nir_options);
    free(words);
    zgfx_shader *shader = NULL;
@@ -173,12 +247,12 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
       }
    }
    uint64_t workgroup_size = 1;
-   for (unsigned i = 0; i < 3; i++) {
+   for (unsigned i = 0; stage == MESA_SHADER_COMPUTE && i < 3; i++) {
       if (!nir->info.workgroup_size[i] || nir->info.workgroup_size[i] > 1024)
          goto fail;
       workgroup_size *= nir->info.workgroup_size[i];
    }
-   if (nir->info.workgroup_size_variable || workgroup_size > 1024) {
+   if (stage == MESA_SHADER_COMPUTE && (nir->info.workgroup_size_variable || workgroup_size > 1024)) {
       fprintf(stderr, "zgfx: unsupported compute workgroup size\n");
       goto fail;
    }
@@ -187,6 +261,7 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
    if (!shader)
       goto fail;
    shader->dev = dev;
+   shader->type = shader_type;
    shader->wave_size = 64;
    nir->info.api_subgroup_size = shader->wave_size;
    nir->info.min_subgroup_size = shader->wave_size;
@@ -203,13 +278,17 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
    NIR_PASS(_, nir, nir_lower_variable_initializers, ~0);
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_split_per_member_structs);
+   if (stage != MESA_SHADER_COMPUTE)
+      NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries, nir_shader_get_entrypoint(nir),
+               nir_var_shader_in | nir_var_shader_out);
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_memcpy);
    NIR_PASS(_, nir, nir_lower_vars_to_ssa);
    NIR_PASS(_, nir, nir_lower_system_values);
-   NIR_PASS(_, nir, nir_lower_compute_system_values,
-            &(nir_lower_compute_system_values_options){.lower_local_invocation_index = true});
+   if (stage == MESA_SHADER_COMPUTE)
+      NIR_PASS(_, nir, nir_lower_compute_system_values,
+               &(nir_lower_compute_system_values_options){.lower_local_invocation_index = true});
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const, nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared, glsl_get_natural_size_align_bytes);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared, nir_address_format_32bit_offset);
@@ -228,24 +307,35 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
       fprintf(stderr, "zgfx: shader exceeds the GPU shared-memory limit\n");
       goto fail;
    }
+   if (stage != MESA_SHADER_COMPUTE && !shader_lower_graphics_io(nir, shader))
+      goto fail;
 
    struct ac_shader_args *args = &shader->args;
    ac_add_arg(args, AC_ARG_SGPR, 2, AC_ARG_VALUE, &shader->argument_ptr);
-   if (BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_NUM_WORKGROUPS))
+   if (stage == MESA_SHADER_VERTEX)
+      ac_add_arg(args, AC_ARG_SGPR, 1, AC_ARG_VALUE, &args->base_vertex);
+   if (stage == MESA_SHADER_COMPUTE && BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_NUM_WORKGROUPS))
       ac_add_arg(args, AC_ARG_SGPR, 3, AC_ARG_VALUE, &args->num_work_groups);
    shader->num_user_sgprs = args->num_sgprs_used;
-   for (unsigned i = 0; i < 3; i++) {
-      if (dev->info.gfx_level >= GFX12)
-         args->workgroup_ids[i].used = true;
-      else
-         ac_add_arg(args, AC_ARG_SGPR, 1, AC_ARG_VALUE, &args->workgroup_ids[i]);
-   }
-   if (dev->info.compiler_info.local_invocation_ids_packed) {
-      ac_add_arg(args, AC_ARG_VGPR, 1, AC_ARG_VALUE, &args->local_invocation_ids_packed);
+   if (stage == MESA_SHADER_VERTEX) {
+      ac_add_arg(args, AC_ARG_VGPR, 1, AC_ARG_VALUE, &args->vertex_id);
+   } else if (stage == MESA_SHADER_FRAGMENT) {
+      ac_add_arg(args, AC_ARG_SGPR, 1, AC_ARG_VALUE, &args->prim_mask);
+      ac_add_arg(args, AC_ARG_VGPR, 2, AC_ARG_VALUE, &args->persp_center);
    } else {
-      ac_add_arg(args, AC_ARG_VGPR, 1, AC_ARG_VALUE, &args->local_invocation_id_x);
-      ac_add_arg(args, AC_ARG_VGPR, 1, AC_ARG_VALUE, &args->local_invocation_id_y);
-      ac_add_arg(args, AC_ARG_VGPR, 1, AC_ARG_VALUE, &args->local_invocation_id_z);
+      for (unsigned i = 0; i < 3; i++) {
+         if (dev->info.gfx_level >= GFX12)
+            args->workgroup_ids[i].used = true;
+         else
+            ac_add_arg(args, AC_ARG_SGPR, 1, AC_ARG_VALUE, &args->workgroup_ids[i]);
+      }
+      if (dev->info.compiler_info.local_invocation_ids_packed) {
+         ac_add_arg(args, AC_ARG_VGPR, 1, AC_ARG_VALUE, &args->local_invocation_ids_packed);
+      } else {
+         ac_add_arg(args, AC_ARG_VGPR, 1, AC_ARG_VALUE, &args->local_invocation_id_x);
+         ac_add_arg(args, AC_ARG_VGPR, 1, AC_ARG_VALUE, &args->local_invocation_id_y);
+         ac_add_arg(args, AC_ARG_VGPR, 1, AC_ARG_VALUE, &args->local_invocation_id_z);
+      }
    }
 
    nir_foreach_function_impl(impl, nir) {
@@ -271,7 +361,7 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
    NIR_PASS(_, nir, ac_nir_lower_intrinsics_to_args, args,
             &(ac_nir_lower_intrinsics_to_args_options){
                .gfx_level = dev->info.gfx_level,
-               .hw_stage = AC_HW_COMPUTE_SHADER,
+               .hw_stage = hw_stage,
                .wave_size = shader->wave_size,
                .workgroup_size = workgroup_size,
                .load_grid_size_from_user_sgpr = true,
@@ -304,10 +394,12 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
       .address32_hi = dev->info.address32_hi,
    };
    const struct aco_shader_info aco_info = {
-      .hw_stage = AC_HW_COMPUTE_SHADER,
+      .hw_stage = hw_stage,
       .wave_size = shader->wave_size,
       .workgroup_size = workgroup_size,
       .lds_size = nir->info.shared_size,
+      .ps.spi_ps_input_ena = stage == MESA_SHADER_FRAGMENT ? S_0286CC_PERSP_CENTER_ENA(1) : 0,
+      .ps.spi_ps_input_addr = stage == MESA_SHADER_FRAGMENT ? S_0286D0_PERSP_CENTER_ENA(1) : 0,
    };
    void *binary = shader;
    aco_compile_shader(&aco_options, &aco_info, 1, &nir, args, shader_build_binary, &binary);
@@ -318,28 +410,42 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
    unsigned vgpr_granularity = dev->info.compiler_info.wave64_vgpr_encode_granularity;
    unsigned vgprs = MAX2(config->num_vgprs, args->num_vgprs_used);
    unsigned sgprs = MAX2(config->num_sgprs, args->num_sgprs_used);
-   config->rsrc1 = S_00B848_VGPRS(DIV_ROUND_UP(vgprs, vgpr_granularity) - 1) |
-                  S_00B848_FLOAT_MODE(config->float_mode) |
-                  S_00B848_DX10_CLAMP(dev->info.gfx_level < GFX11_7);
-   if (dev->info.gfx_level < GFX10)
-      config->rsrc1 |= S_00B848_SGPRS(DIV_ROUND_UP(sgprs, 8) - 1);
-   if (dev->info.gfx_level >= GFX10 && dev->info.gfx_level <= GFX11_7)
-      config->rsrc1 |= S_00B848_MEM_ORDERED(config->mem_ordered);
-   if (dev->info.gfx_level >= GFX10)
-      config->rsrc1 |= S_00B848_WGP_MODE(config->wgp_mode);
-   config->rsrc2 = S_00B84C_USER_SGPR(shader->num_user_sgprs) |
-                  S_00B84C_TGID_X_EN(1) | S_00B84C_TGID_Y_EN(1) | S_00B84C_TGID_Z_EN(1) |
-                  S_00B84C_TIDIG_COMP_CNT(2) |
-                  S_00B84C_LDS_SIZE(ac_shader_encode_lds_size(config->lds_size, dev->info.gfx_level,
-                                                             MESA_SHADER_COMPUTE));
-   config->rsrc3 = 0;
-   if (dev->info.gfx_level >= GFX10)
-      config->rsrc3 = S_00B8A0_SHARED_VGPR_CNT(config->num_shared_vgprs / 8);
-   if (dev->info.gfx_level >= GFX11) {
-      unsigned prefetch = ac_get_instr_prefetch_size(dev->info.gfx_level,
-                                                     dev->info.instr_prefetch_distance, shader->exec_size);
-      config->rsrc3 |= dev->info.gfx_level >= GFX12 ? S_00B8A0_INST_PREF_SIZE_GFX12(prefetch) :
-                                                   S_00B8A0_INST_PREF_SIZE_GFX11(prefetch);
+   if (stage == MESA_SHADER_COMPUTE) {
+      config->rsrc1 = S_00B848_VGPRS(DIV_ROUND_UP(vgprs, vgpr_granularity) - 1) |
+                     S_00B848_FLOAT_MODE(config->float_mode) |
+                     S_00B848_DX10_CLAMP(dev->info.gfx_level < GFX11_7);
+      if (dev->info.gfx_level < GFX10)
+         config->rsrc1 |= S_00B848_SGPRS(DIV_ROUND_UP(sgprs, 8) - 1);
+      if (dev->info.gfx_level >= GFX10 && dev->info.gfx_level <= GFX11_7)
+         config->rsrc1 |= S_00B848_MEM_ORDERED(config->mem_ordered);
+      if (dev->info.gfx_level >= GFX10)
+         config->rsrc1 |= S_00B848_WGP_MODE(config->wgp_mode);
+      config->rsrc2 = S_00B84C_USER_SGPR(shader->num_user_sgprs) |
+                     S_00B84C_TGID_X_EN(1) | S_00B84C_TGID_Y_EN(1) | S_00B84C_TGID_Z_EN(1) |
+                     S_00B84C_TIDIG_COMP_CNT(2) |
+                     S_00B84C_LDS_SIZE(ac_shader_encode_lds_size(config->lds_size, dev->info.gfx_level,
+                                                                MESA_SHADER_COMPUTE));
+      config->rsrc3 = 0;
+      if (dev->info.gfx_level >= GFX10)
+         config->rsrc3 = S_00B8A0_SHARED_VGPR_CNT(config->num_shared_vgprs / 8);
+      if (dev->info.gfx_level >= GFX11) {
+         unsigned prefetch = ac_get_instr_prefetch_size(dev->info.gfx_level,
+                                                        dev->info.instr_prefetch_distance, shader->exec_size);
+         config->rsrc3 |= dev->info.gfx_level >= GFX12 ? S_00B8A0_INST_PREF_SIZE_GFX12(prefetch) :
+                                                      S_00B8A0_INST_PREF_SIZE_GFX11(prefetch);
+      }
+   } else {
+      config->rsrc1 = S_00B128_VGPRS(DIV_ROUND_UP(vgprs, vgpr_granularity) - 1) |
+                     S_00B128_FLOAT_MODE(config->float_mode) | S_00B128_DX10_CLAMP(1);
+      if (dev->info.gfx_level < GFX10)
+         config->rsrc1 |= S_00B128_SGPRS(DIV_ROUND_UP(sgprs, 8) - 1);
+      else
+         config->rsrc1 |= stage == MESA_SHADER_VERTEX ? S_00B128_MEM_ORDERED(config->mem_ordered) :
+                                                      S_00B028_MEM_ORDERED(config->mem_ordered);
+      config->rsrc2 = S_00B12C_USER_SGPR(shader->num_user_sgprs);
+      if (dev->info.gfx_level >= GFX10)
+         config->rsrc2 |= stage == MESA_SHADER_VERTEX ? S_00B12C_SHARED_VGPR_CNT(config->num_shared_vgprs / 8) :
+                                                      S_00B02C_SHARED_VGPR_CNT(config->num_shared_vgprs / 8);
    }
 
    unsigned upload_size = ac_align_shader_binary_for_prefetch(dev->info.gfx_level,

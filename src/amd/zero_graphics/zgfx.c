@@ -538,6 +538,7 @@ PUBLIC void command_clear(zgfx_command *cmd, void *backbuffer, uint32_t color, u
 }
 PUBLIC void command_set_compute_shader(zgfx_command *cmd, zgfx_shader* shader) {
    assert(cmd && shader && cmd->dev == shader->dev);
+   assert(shader->type == ZGFX_SHADER_COMPUTE);
    assert(shader->code && !shader->config.scratch_bytes_per_wave);
 
    const struct radeon_info *info = &cmd->dev->info;
@@ -581,6 +582,7 @@ PUBLIC void command_set_compute_shader(zgfx_command *cmd, zgfx_shader* shader) {
 }
 PUBLIC void command_set_compute_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data) {
    assert(cmd && shader && cmd->dev == shader->dev);
+   assert(shader->type == ZGFX_SHADER_COMPUTE);
    assert(shader->argument_ptr.used);
 
    unsigned offset = R_00B900_COMPUTE_USER_DATA_0 +
