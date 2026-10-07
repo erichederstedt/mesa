@@ -1,5 +1,8 @@
 #include "zgfx.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <xcb/xcb.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
@@ -70,7 +73,7 @@ int main(void) {
    print_array("target", target, 32);
    #endif
 
-   #if 1
+   #if 0
    typedef struct __attribute__((aligned(16))) Vertex
    {
       float3 position;
@@ -104,6 +107,32 @@ int main(void) {
    command_draw(cmd, 3);
    queue_submit(dev, cmd);
    stbi_write_bmp("pos_output.bmp", 1024, 1024, 4, backbuffer);
+   #endif
+
+   #if 1
+   /* Open the connection to the X server */
+   xcb_connection_t *connection = xcb_connect(NULL, NULL);
+
+   /* Get the first screen */
+   const xcb_setup_t *setup = xcb_get_setup(connection);
+   xcb_screen_iterator_t iter = xcb_setup_roots_iterator(setup);
+   xcb_screen_t *screen = iter.data;
+
+   /* Create the window */
+   xcb_window_t window = xcb_generate_id (connection);
+   xcb_create_window_checked(connection, screen->root_depth, window, screen->root, 0, 0, 150, 150, 10, XCB_WINDOW_CLASS_INPUT_OUTPUT, screen->root_visual, 0, NULL);
+   const char title[] = "zgfx demo";
+   xcb_change_property(connection, XCB_PROP_MODE_REPLACE, window, XCB_ATOM_WM_NAME, XCB_ATOM_STRING, 8, sizeof(title) - 1, title);
+
+   /* Map the window on the screen */
+   xcb_map_window(connection, window);
+
+   /* Make sure commands are sent before we pause so that the window gets shown */
+   xcb_flush(connection);
+
+   pause(); /* hold client until Ctrl-C */
+
+   xcb_disconnect(connection);
    #endif
 
    return 0;

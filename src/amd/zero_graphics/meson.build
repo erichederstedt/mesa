@@ -26,5 +26,6 @@ executable(
   'zgfx_demo',
   'demo.c',
   link_with : libzgfx,
+  dependencies : dependency('xcb'),
   install : false,
 )
