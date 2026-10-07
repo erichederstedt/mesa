@@ -46,7 +46,7 @@ void *galloct(zgfx_device *dev, uint64_t width, uint64_t height, zgfx_color_form
 
 zgfx_command *command_begin(zgfx_device *dev);
 void command_nop(zgfx_command *cmd);
-void command_clear(zgfx_command *cmd, void *backbuffer, uint32_t color, uint64_t size);
+void command_clear(zgfx_command *cmd, void *backbuffer, uint32_t color /*0xAABBGGRR*/, uint64_t size);
 void command_set_compute_shader(zgfx_command *cmd, zgfx_shader* shader);
 void command_set_compute_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data);
 void command_dispatch(zgfx_command *cmd, int x, int y, int z);

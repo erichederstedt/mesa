@@ -79,14 +79,8 @@ int main(void) {
    } Vertex;
    Vertex* vertices = galloc(dev, sizeof(Vertex) * 3);
    vertices[0].position = (float3){.x = -0.5f, .y = -0.5f, .z = 0.0f};
-   //vertices[0].color = (float4){-0.5, -0.5, 0.0, 1.0};
-   //vertices[0].color = (float4){1.0, 0.0, 0.0, 1.0};
    vertices[1].position = (float3){.x = 0.5f, .y = -0.5f, .z = 0.0f};
-   //vertices[1].color = (float4){0.5, -0.5, 0.0, 1.0};
-   //vertices[1].color = (float4){0.0, 1.0, 0.0, 1.0};
    vertices[2].position = (float3){.x = 0.0f, .y = 0.5f, .z = 0.0f};
-   //vertices[2].color = (float4){0.0, 0.5, 0.0, 1.0};
-   //vertices[2].color = (float4){0.0, 0.0, 1.0, 1.0};
    float4* triColor = galloc(dev, sizeof(float4));
    triColor->x = 1.0;
    triColor->y = 0.0;
@@ -96,7 +90,7 @@ int main(void) {
    zgfx_shader* ps_shader = shader_create(dev, demo_triangle_spv, demo_triangle_spv_len, ZGFX_SHADER_PIXEL, "fragmentMain");
    void *backbuffer = galloct(dev, 1024, 1024, ZGFX_COLOR_RGBA8_UNORM, 1, 1);
    zgfx_command *cmd = command_begin(dev);
-   command_clear(cmd, backbuffer, 0x00FF0000, 0);
+   command_clear(cmd, backbuffer, 0x00000000, 0);
    command_set_rendertarget(cmd, backbuffer, 1024, 1024, ZGFX_COLOR_RGBA8_UNORM);
    command_set_viewport(cmd, (zgfx_viewport){
       .x = 0, .y = 0,
