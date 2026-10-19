@@ -24,6 +24,7 @@ struct zgfx_device {
    uint64_t buffers_align[MAX_BUFFER_COUNT];
    amdgpu_bo_handle buffers_bo_handle[MAX_BUFFER_COUNT];
    amdgpu_va_handle buffers_va_handle[MAX_BUFFER_COUNT];
+   bool buffers_external[MAX_BUFFER_COUNT];
    uint64_t buffers_count;
 };
 struct zgfx_command {

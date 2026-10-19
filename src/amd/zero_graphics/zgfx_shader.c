@@ -16,6 +16,14 @@
 #include "sid.h"
 #include "util/macros.h"
 
+PUBLIC void shader_destroy(zgfx_shader *shader)
+{
+   if (!shader)
+      return;
+   gfree(shader->dev, shader->code);
+   free(shader);
+}
+
 static bool shader_check_spirv(const uint32_t *words, size_t count)
 {
    if (words[0] != SpvMagicNumber)

@@ -63,6 +63,7 @@ PUBLIC zgfx_device *device_create(void) {
 PUBLIC uint8_t format_is_block_compressed(zgfx_color_format format) {
    switch (format) {
       case ZGFX_COLOR_RGBA32_FLOAT:
+      case ZGFX_COLOR_BGRA8_UNORM:
       case ZGFX_COLOR_RGBA8_UNORM:
          return 0;
       default:
@@ -75,6 +76,7 @@ PUBLIC uint64_t format_bit_size(zgfx_color_format format) {
       case ZGFX_COLOR_RGBA32_FLOAT:
          return 128;
       case ZGFX_COLOR_RGBA8_UNORM:
+      case ZGFX_COLOR_BGRA8_UNORM:
          return 32;
       default:
          assert(0 && "Unsupported format");
@@ -170,9 +172,47 @@ PUBLIC void *galloca(zgfx_device *dev, uint64_t size, uint64_t align) {
    dev->buffers_align[buffer_index] = align;
    dev->buffers_bo_handle[buffer_index] = bo_handle;
    dev->buffers_va_handle[buffer_index] = va_handle;
+   dev->buffers_external[buffer_index] = false;
    return ptr;
 }
-PUBLIC void *galloct(zgfx_device *dev, uint64_t width, uint64_t height, zgfx_color_format format, uint64_t mip_count, uint64_t array_count) {
+PUBLIC void gfree(zgfx_device *dev, void *ptr) {
+   if (!ptr)
+      return;
+   uint64_t i = find_buffer(dev, ptr);
+   assert(i != UINT64_MAX);
+   uint64_t page_size = getpagesize();
+   uint64_t size = (dev->buffers_size[i] + dev->buffers_align[i] + page_size - 1) & ~(page_size - 1);
+   int err = amdgpu_bo_va_op_raw(dev->device_handle, dev->buffers_bo_handle[i], 0, size,
+                                (uintptr_t)dev->buffers_raw_ptr[i], 0, AMDGPU_VA_OP_UNMAP);
+   assert(err == 0);
+   err = amdgpu_va_range_free(dev->buffers_va_handle[i]);
+   assert(err == 0);
+   err = amdgpu_bo_cpu_unmap(dev->buffers_bo_handle[i]);
+   assert(err == 0);
+   err = amdgpu_bo_free(dev->buffers_bo_handle[i]);
+   assert(err == 0);
+   uint64_t last = --dev->buffers_count;
+   dev->buffers_raw_ptr[i] = dev->buffers_raw_ptr[last];
+   dev->buffers_ptr[i] = dev->buffers_ptr[last];
+   dev->buffers_size[i] = dev->buffers_size[last];
+   dev->buffers_align[i] = dev->buffers_align[last];
+   dev->buffers_bo_handle[i] = dev->buffers_bo_handle[last];
+   dev->buffers_va_handle[i] = dev->buffers_va_handle[last];
+   dev->buffers_external[i] = dev->buffers_external[last];
+}
+
+PUBLIC void device_destroy(zgfx_device *dev) {
+   if (!dev)
+      return;
+   while (dev->buffers_count)
+      gfree(dev, dev->buffers_ptr[dev->buffers_count - 1]);
+   amdgpu_cs_ctx_free(dev->context_handle);
+   amdgpu_device_deinitialize(dev->device_handle);
+   close(dev->fd);
+   free(dev);
+}
+
+PUBLIC zgfx_texture *galloct(zgfx_device *dev, uint64_t width, uint64_t height, zgfx_color_format format, uint64_t mip_count, uint64_t array_count) {
    assert(mip_count >= 1 && "mip_count must be at least 1");
    assert(array_count >= 1 && "array_count must be at least 1");
    
@@ -360,6 +400,32 @@ PUBLIC zgfx_command *command_begin(zgfx_device *dev) {
 
    return cmd;
 }
+PUBLIC void command_reset(zgfx_command *cmd) {
+   while (cmd->ib_count > 1)
+      gfree(cmd->dev, cmd->ib_ptrs[--cmd->ib_count]);
+   cmd->ib_cwds[0] = 0;
+   cmd->cs = (struct ac_cmdbuf){
+      .buf = cmd->ib_ptrs[0],
+      .max_dw = cmd->ib_sizes[0] / sizeof(uint32_t) - 4,
+      .reserved_dw = cmd->ib_sizes[0] / sizeof(uint32_t) - 4,
+   };
+   cmd->compute_shader = NULL;
+   cmd->vertex_shader = NULL;
+   cmd->pixel_shader = NULL;
+   command_emit_graphics(cmd);
+}
+
+PUBLIC void command_destroy(zgfx_command *cmd) {
+   if (!cmd)
+      return;
+   for (uint64_t i = 0; i < cmd->ib_count; i++)
+      gfree(cmd->dev, cmd->ib_ptrs[i]);
+   free(cmd->ib_ptrs);
+   free(cmd->ib_sizes);
+   free(cmd->ib_cwds);
+   free(cmd);
+}
+
 static void command_chain(zgfx_command *cmd, uint64_t old_cdw) {
    assert(cmd->ib_count >= 2);
 
@@ -849,10 +915,10 @@ PUBLIC void command_set_viewport(zgfx_command *cmd, zgfx_viewport viewport) {
    ac_pm4_emit_commands(&cmd->cs, &pm4);
 }
 
-PUBLIC void command_set_rendertarget(zgfx_command *cmd, void *rendertarget,
+PUBLIC void command_set_rendertarget(zgfx_command *cmd, zgfx_texture *rendertarget,
                                     uint64_t width, uint64_t height, zgfx_color_format format) {
    assert(cmd && rendertarget && width && height && width <= 16384 && height <= 16384);
-   assert(format == ZGFX_COLOR_RGBA8_UNORM || format == ZGFX_COLOR_RGBA32_FLOAT);
+   assert(format == ZGFX_COLOR_RGBA8_UNORM || format == ZGFX_COLOR_RGBA32_FLOAT || format == ZGFX_COLOR_BGRA8_UNORM);
    const struct radeon_info *info = &cmd->dev->info;
    assert(info->has_graphics && info->gfx_level < GFX11);
    uint64_t va = (uint64_t)(uintptr_t)rendertarget;
@@ -861,6 +927,7 @@ PUBLIC void command_set_rendertarget(zgfx_command *cmd, void *rendertarget,
    unsigned pitch = align(width * bpe, 256) / bpe;
    uint64_t buffer_index = find_buffer(cmd->dev, rendertarget);
    assert(buffer_index != UINT64_MAX && cmd->dev->buffers_size[buffer_index] >= (uint64_t)pitch * height * bpe);
+   assert(!cmd->dev->buffers_external[buffer_index]);
 
    struct radeon_surf surf = {0};
    surf.bpe = bpe;
@@ -882,7 +949,8 @@ PUBLIC void command_set_rendertarget(zgfx_command *cmd, void *rendertarget,
    struct ac_cb_surface cb = {0};
    ac_init_cb_surface(info, &(struct ac_cb_state){
       .surf = &surf,
-      .format = format == ZGFX_COLOR_RGBA8_UNORM ? PIPE_FORMAT_R8G8B8A8_UNORM : PIPE_FORMAT_R32G32B32A32_FLOAT,
+      .format = format == ZGFX_COLOR_BGRA8_UNORM ? PIPE_FORMAT_B8G8R8A8_UNORM :
+                format == ZGFX_COLOR_RGBA8_UNORM ? PIPE_FORMAT_R8G8B8A8_UNORM : PIPE_FORMAT_R32G32B32A32_FLOAT,
       .width = width, .height = height,
       .num_layers = 0, .num_samples = 1, .num_storage_samples = 1, .num_levels = 1,
    }, &cb);
@@ -1014,7 +1082,14 @@ PUBLIC void queue_submit(zgfx_device *dev, zgfx_command *cmd) {
    ib_info.size = cmd->ib_cwds[0];
 
    amdgpu_bo_list_handle bo_list_handle = 0;
-   amdgpu_bo_list_create(dev->device_handle, dev->buffers_count, dev->buffers_bo_handle, NULL, &bo_list_handle);
+   amdgpu_bo_handle bos[MAX_BUFFER_COUNT];
+   unsigned bo_count = 0;
+   for (uint64_t i = 0; i < dev->buffers_count; i++) {
+      if (!dev->buffers_external[i])
+         bos[bo_count++] = dev->buffers_bo_handle[i];
+   }
+   int err = amdgpu_bo_list_create(dev->device_handle, bo_count, bos, NULL, &bo_list_handle);
+   assert(err == 0);
    
    struct amdgpu_cs_request request = {0};
    request.flags = 0;
@@ -1028,7 +1103,7 @@ PUBLIC void queue_submit(zgfx_device *dev, zgfx_command *cmd) {
    request.ibs = &ib_info;
    request.seq_no = 0;
    request.fence_info.handle = NULL;
-   int err = amdgpu_cs_submit(dev->context_handle, 0, &request, 1);
+   err = amdgpu_cs_submit(dev->context_handle, 0, &request, 1);
    assert(err == 0 && "failed to amdgpu_cs_submit");
 
    struct amdgpu_cs_fence fence = {0};
