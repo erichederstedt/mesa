@@ -653,7 +653,7 @@ PUBLIC void command_set_compute_shader(zgfx_command *cmd, zgfx_shader* shader) {
    ac_pm4_emit_commands(&cmd->cs, &pm4);
    cmd->compute_shader = shader;
 }
-PUBLIC void command_set_compute_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data) {
+PUBLIC void command_set_compute_shader_arg(zgfx_command *cmd, zgfx_shader* shader, void* data) {
    assert(cmd && shader && cmd->dev == shader->dev);
    assert(shader->type == ZGFX_SHADER_COMPUTE);
    assert(shader->argument_ptr.used);
@@ -781,7 +781,7 @@ static void command_set_graphics_shader_args(zgfx_command *cmd, zgfx_shader *sha
    ac_pm4_emit_commands(&cmd->cs, &pm4);
 }
 
-PUBLIC void command_set_vertex_shader_args(zgfx_command *cmd, zgfx_shader *shader, void *data) {
+PUBLIC void command_set_vertex_shader_arg(zgfx_command *cmd, zgfx_shader *shader, void *data) {
    command_set_graphics_shader_args(cmd, shader, data, ZGFX_SHADER_VERTEX);
 }
 
@@ -818,7 +818,7 @@ PUBLIC void command_set_pixel_shader(zgfx_command *cmd, zgfx_shader *shader) {
    cmd->pixel_shader = shader;
 }
 
-PUBLIC void command_set_pixel_shader_args(zgfx_command *cmd, zgfx_shader *shader, void *data) {
+PUBLIC void command_set_pixel_shader_arg(zgfx_command *cmd, zgfx_shader *shader, void *data) {
    command_set_graphics_shader_args(cmd, shader, data, ZGFX_SHADER_PIXEL);
 }
 
@@ -1123,4 +1123,19 @@ PUBLIC void queue_submit(zgfx_device *dev, zgfx_command *cmd) {
    }
    assert(expired == 1 && "failed to completely execute IB");
    amdgpu_bo_list_destroy(bo_list_handle);
+}
+
+
+PUBLIC void command_set_compute_shader_args_impl(zgfx_command *cmd, zgfx_shader *shader, Args *args, size_t count) {
+   // Implement
+}
+PUBLIC void command_set_vertex_shader_args_impl(zgfx_command *cmd, zgfx_shader *shader, Args *args, size_t count) {
+   // Implement
+   for (size_t i = 0; i < count; i++)
+   {
+      printf("%zu\n", args[i].size);
+   }
+}
+PUBLIC void command_set_pixel_shader_args_impl(zgfx_command *cmd, zgfx_shader *shader, Args *args, size_t count) {
+   // Implement
 }
