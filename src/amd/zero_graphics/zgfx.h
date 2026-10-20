@@ -34,7 +34,6 @@ typedef struct zgfx_viewport {
     float    minDepth;
     float    maxDepth;
 } zgfx_viewport;
-typedef struct zgfx_texture zgfx_texture; // INTERNAL NOTE: Don't actually define zgfx_texture. It is essentially void* with extra type type checking.
 
 zgfx_device *device_create(void);
 void device_destroy(zgfx_device *dev);
@@ -47,7 +46,7 @@ uint64_t format_compute_mip_size(zgfx_color_format format, uint64_t width, uint6
 void *galloc(zgfx_device *dev, uint64_t size);
 void gfree(zgfx_device *dev, void *ptr);
 void *galloca(zgfx_device *dev, uint64_t size, uint64_t align);                                                                       // aligned
-zgfx_texture *galloct(zgfx_device *dev, uint64_t width, uint64_t height, zgfx_color_format format, uint64_t mip_count, uint64_t array_count); // texture
+void *galloct(zgfx_device *dev, uint64_t width, uint64_t height, zgfx_color_format format, uint64_t mip_count, uint64_t array_count); // texture
 
 zgfx_command *command_begin(zgfx_device *dev);
 void command_reset(zgfx_command *cmd);
@@ -63,7 +62,7 @@ void command_set_pixel_shader(zgfx_command *cmd, zgfx_shader* shader);
 void command_set_pixel_shader_args(zgfx_command *cmd, zgfx_shader* shader, void* data);
 void command_draw(zgfx_command *cmd, int vertexCount);
 void command_set_viewport(zgfx_command *cmd, zgfx_viewport viewport); // just single view port for now
-void command_set_rendertarget(zgfx_command *cmd, zgfx_texture* rendertarget, uint64_t width, uint64_t height, zgfx_color_format format);
+void command_set_rendertarget(zgfx_command *cmd, void* rendertarget, uint64_t width, uint64_t height, zgfx_color_format format);
 
 void queue_submit(zgfx_device *dev, zgfx_command *cmd);
 
@@ -88,8 +87,8 @@ typedef struct zgfx_swapchain_info {
 } zgfx_swapchain_info;
 zgfx_swapchain *swapchain_create(zgfx_device *dev, zgfx_swapchain_desc desc);
 zgfx_swapchain_result swapchain_get_info(zgfx_swapchain *swapchain, zgfx_swapchain_info *info);
-zgfx_swapchain_result swapchain_acquire(zgfx_swapchain *swapchain, zgfx_texture **frame);
-int swapchain_present(zgfx_swapchain *swapchain, const zgfx_texture *frame);
+zgfx_swapchain_result swapchain_acquire(zgfx_swapchain *swapchain, void **frame);
+int swapchain_present(zgfx_swapchain *swapchain, const void *frame);
 void swapchain_destroy(zgfx_swapchain *swapchain);
 
 #ifdef __cplusplus

@@ -362,7 +362,7 @@ PUBLIC zgfx_swapchain_result swapchain_get_info(zgfx_swapchain *chain, zgfx_swap
    return ZGFX_SWAPCHAIN_NOT_READY;
 }
 
-PUBLIC zgfx_swapchain_result swapchain_acquire(zgfx_swapchain *chain, zgfx_texture **frame)
+PUBLIC zgfx_swapchain_result swapchain_acquire(zgfx_swapchain *chain, void **frame)
 {
    if (!frame)
       return ZGFX_SWAPCHAIN_ERROR;
@@ -379,7 +379,7 @@ PUBLIC zgfx_swapchain_result swapchain_acquire(zgfx_swapchain *chain, zgfx_textu
    }
 }
 
-PUBLIC int swapchain_present(zgfx_swapchain *chain, const zgfx_texture *frame)
+PUBLIC int swapchain_present(zgfx_swapchain *chain, const void *frame)
 {
    if (!chain || !frame)
       return -1;

@@ -229,7 +229,7 @@ int main(void) {
          break;
       }
       if (mapped) {
-         zgfx_texture *frame = NULL;
+         void *frame = NULL;
          zgfx_swapchain_result acquired = swapchain_acquire(swapchain, &frame);
          if (acquired == ZGFX_SWAPCHAIN_ERROR) {
             result = 1;

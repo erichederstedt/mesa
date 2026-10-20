@@ -212,7 +212,7 @@ PUBLIC void device_destroy(zgfx_device *dev) {
    free(dev);
 }
 
-PUBLIC zgfx_texture *galloct(zgfx_device *dev, uint64_t width, uint64_t height, zgfx_color_format format, uint64_t mip_count, uint64_t array_count) {
+PUBLIC void *galloct(zgfx_device *dev, uint64_t width, uint64_t height, zgfx_color_format format, uint64_t mip_count, uint64_t array_count) {
    assert(mip_count >= 1 && "mip_count must be at least 1");
    assert(array_count >= 1 && "array_count must be at least 1");
    
@@ -915,7 +915,7 @@ PUBLIC void command_set_viewport(zgfx_command *cmd, zgfx_viewport viewport) {
    ac_pm4_emit_commands(&cmd->cs, &pm4);
 }
 
-PUBLIC void command_set_rendertarget(zgfx_command *cmd, zgfx_texture *rendertarget,
+PUBLIC void command_set_rendertarget(zgfx_command *cmd, void *rendertarget,
                                     uint64_t width, uint64_t height, zgfx_color_format format) {
    assert(cmd && rendertarget && width && height && width <= 16384 && height <= 16384);
    assert(format == ZGFX_COLOR_RGBA8_UNORM || format == ZGFX_COLOR_RGBA32_FLOAT || format == ZGFX_COLOR_BGRA8_UNORM);
