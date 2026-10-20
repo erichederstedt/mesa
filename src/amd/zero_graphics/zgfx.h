@@ -86,7 +86,7 @@ typedef struct zgfx_swapchain_info {
     zgfx_color_format format;
 } zgfx_swapchain_info;
 zgfx_swapchain *swapchain_create(zgfx_device *dev, zgfx_swapchain_desc desc);
-zgfx_swapchain_result swapchain_get_info(zgfx_swapchain *swapchain, zgfx_swapchain_info *info);
+zgfx_swapchain_info swapchain_get_info(zgfx_swapchain *chain);
 zgfx_swapchain_result swapchain_acquire(zgfx_swapchain *swapchain, void **frame);
 int swapchain_present(zgfx_swapchain *swapchain, const void *frame);
 void swapchain_destroy(zgfx_swapchain *swapchain);

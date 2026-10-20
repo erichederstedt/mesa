@@ -346,20 +346,9 @@ PUBLIC zgfx_swapchain *swapchain_create(zgfx_device *dev, zgfx_swapchain_desc de
    return zgfx_x11_swapchain_create(dev, desc.xcb.connection, desc.xcb.window);
 }
 
-PUBLIC zgfx_swapchain_result swapchain_get_info(zgfx_swapchain *chain, zgfx_swapchain_info *info)
+PUBLIC zgfx_swapchain_info swapchain_get_info(zgfx_swapchain *chain)
 {
-   if (!info)
-      return ZGFX_SWAPCHAIN_ERROR;
-   *info = (zgfx_swapchain_info){0};
-   if (!chain || chain->lost || xcb_connection_has_error(chain->connection))
-      return ZGFX_SWAPCHAIN_ERROR;
-   for (unsigned i = 0; i < ARRAY_SIZE(chain->images); i++) {
-      if (chain->images[i].acquired) {
-         *info = (zgfx_swapchain_info){chain->image_width, chain->image_height, chain->stride, chain->format};
-         return ZGFX_SWAPCHAIN_READY;
-      }
-   }
-   return ZGFX_SWAPCHAIN_NOT_READY;
+   return (zgfx_swapchain_info){chain->image_width, chain->image_height, chain->stride, chain->format};
 }
 
 PUBLIC zgfx_swapchain_result swapchain_acquire(zgfx_swapchain *chain, void **frame)
