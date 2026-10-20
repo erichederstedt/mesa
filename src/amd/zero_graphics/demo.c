@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <xcb/xcb.h>
+#include <X11/Xlib.h>
+#include <X11/Xlib-xcb.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
@@ -112,7 +114,7 @@ int main(void) {
    stbi_write_bmp("pos_output.bmp", 1024, 1024, 4, backbuffer);
    #endif
 
-   #if 1
+   #if 0
    int result = 1;
    int screen_number = 0;
    xcb_connection_t *connection = xcb_connect(NULL, &screen_number);
@@ -236,11 +238,7 @@ int main(void) {
             break;
          }
          if (acquired == ZGFX_SWAPCHAIN_READY) {
-            zgfx_swapchain_info info;
-            if (swapchain_get_info(swapchain, &info) != ZGFX_SWAPCHAIN_READY) {
-               result = 1;
-               break;
-            }
+            zgfx_swapchain_info info = swapchain_get_info(swapchain);
             command_reset(cmd);
             command_clear(cmd, frame, 0xff202020, 0);
             command_set_rendertarget(cmd, frame, info.width, info.height, info.format);
@@ -274,6 +272,98 @@ cleanup:
    xcb_disconnect(connection);
    device_destroy(dev);
    return result;
+   #endif
+
+   #if 1
+   Display *display = XOpenDisplay(NULL);
+   Window window = XCreateSimpleWindow(
+      display,
+      XDefaultRootWindow(display),	// parent
+      0, 0,							// x, y
+      800, 600,						// width, height
+      0,								// border width
+      0x00000000,						// border color
+      0x00000000						// background color
+   );
+   XStoreName(display, window, "zgfx demo");
+   XSelectInput(display, window, KeyPressMask|KeyReleaseMask|ExposureMask|StructureNotifyMask);
+   XMapWindow(display, window);
+   Atom wm_delete_window = XInternAtom(display, "WM_DELETE_WINDOW", False);
+   XSetWMProtocols(display, window, &wm_delete_window, 1);
+   XFlush(display);
+
+   zgfx_swapchain *swapchain = swapchain_create(dev, (zgfx_swapchain_desc){
+      .xcb = {
+         .connection = XGetXCBConnection(display),
+         .window = window
+      }
+   });
+   if (!swapchain)
+      goto cleanup_swapchain;
+
+   zgfx_shader *vs_shader = shader_create(dev, demo_triangle_spv, demo_triangle_spv_len, ZGFX_SHADER_VERTEX, "vertexMain");
+   zgfx_shader *ps_shader = shader_create(dev, demo_triangle_spv, demo_triangle_spv_len, ZGFX_SHADER_PIXEL, "fragmentMain");
+   if (!vs_shader || !ps_shader)
+      goto cleanup_shaders;
+   
+   typedef struct Vertex {
+      float3 position;
+      float3 normal;
+      float2 uv;
+   } Vertex;
+   Vertex *vertices = galloc(dev, sizeof(Vertex) * 3);
+   vertices[0] = (Vertex){.position = {.x = -0.5f, .y = -0.5f, .z = 0.0f}};
+   vertices[1] = (Vertex){.position = {.x =  0.5f, .y = -0.5f, .z = 0.0f}};
+   vertices[2] = (Vertex){.position = {.x =  0.0f, .y =  0.5f, .z = 0.0f}};
+
+   float4 *triColor = galloc(dev, sizeof(float4));
+   *triColor = (float4){.x = 1.0f, .y = 0.0f, .z = 0.0f, .w = 1.0f};
+
+   zgfx_command *cmd = command_begin(dev);
+   int quit = 0;
+   while (!quit) {
+      while (XPending(display) > 0) {
+         XEvent event = {0};
+         XNextEvent(display, &event);
+         if (event.type == ClientMessage && event.xclient.data.l[0] == wm_delete_window) {
+            quit = 1;
+         }
+      }
+
+      void *frame = NULL;
+      zgfx_swapchain_result acquired = swapchain_acquire(swapchain, &frame);
+      if (acquired == ZGFX_SWAPCHAIN_ERROR) {
+         break;
+      }
+      if (acquired == ZGFX_SWAPCHAIN_NOT_READY) {
+         continue;
+      }
+
+      zgfx_swapchain_info info = swapchain_get_info(swapchain);
+      command_reset(cmd);
+      command_clear(cmd, frame, 0xff202020, 0);
+      command_set_rendertarget(cmd, frame, info.width, info.height, info.format);
+      command_set_viewport(cmd, (zgfx_viewport){
+         .width = info.width, .height = info.height, .minDepth = 0, .maxDepth = 1,
+      });
+      command_set_vertex_shader(cmd, vs_shader);
+      command_set_vertex_shader_args(cmd, vs_shader, vertices);
+      command_set_pixel_shader(cmd, ps_shader);
+      command_set_pixel_shader_args(cmd, ps_shader, triColor);
+      command_draw(cmd, 3);
+      queue_submit(dev, cmd);
+      if (swapchain_present(swapchain, frame) != 0) {
+         break;
+      }
+   }
+
+   command_destroy(cmd);
+cleanup_shaders:
+   shader_destroy(vs_shader);
+   shader_destroy(ps_shader);
+cleanup_swapchain:
+   swapchain_destroy(swapchain);
+   XCloseDisplay(display);
    #endif
 
    device_destroy(dev);

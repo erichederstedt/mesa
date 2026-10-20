@@ -28,6 +28,6 @@ executable(
   'zgfx_demo',
   'demo.c',
   link_with : libzgfx,
-  dependencies : [dep_libdrm, dependency('xcb'), dependency('xcb-dri3'), dependency('xcb-present')],
+  dependencies : [dep_libdrm, dependency('xcb'), dependency('xcb-dri3'), dependency('xcb-present'), dependency('x11'), dependency('x11-xcb')],
   install : false,
 )
