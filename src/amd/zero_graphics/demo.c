@@ -7,6 +7,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xlib-xcb.h>
 #include <unistd.h>
+#include <time.h>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
@@ -48,6 +49,11 @@ static void print_array(char* name, uint32_t* array, uint32_t count) {
          printf(", ");
    }
    printf("\n");
+}
+
+static inline double elapsed_ns(struct timespec a, struct timespec b)
+{
+    return (double)(b.tv_sec - a.tv_sec) * 1e9 + (double)(b.tv_nsec - a.tv_nsec);
 }
 
 int main(void) {
@@ -324,6 +330,9 @@ cleanup:
    zgfx_command *cmd = command_begin(dev);
    int quit = 0;
    while (!quit) {
+      struct timespec start, end;
+      clock_gettime(CLOCK_MONOTONIC, &start);
+
       while (XPending(display) > 0) {
          XEvent event = {0};
          XNextEvent(display, &event);
@@ -351,7 +360,7 @@ cleanup:
       });
       command_set_vertex_shader(cmd, vs_shader);
       command_set_vertex_shader_arg(cmd, vs_shader, vertices);
-      command_set_vertex_shader_args(cmd, vs_shader, vertices, vertices, vertices);
+      // command_set_vertex_shader_args(cmd, vs_shader, vertices, vertices, vertices);
       command_set_pixel_shader(cmd, ps_shader);
       command_set_pixel_shader_arg(cmd, ps_shader, triColor);
       command_draw(cmd, 3);
@@ -359,6 +368,9 @@ cleanup:
       if (swapchain_present(swapchain, frame) != 0) {
          break;
       }
+
+      clock_gettime(CLOCK_MONOTONIC, &end);
+      printf("Elapsed: %.0f ns (%.6f ms)\n", elapsed_ns(start, end), elapsed_ns(start, end) / 1e6);
    }
 
    command_destroy(cmd);
