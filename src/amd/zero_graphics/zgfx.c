@@ -883,6 +883,8 @@ PUBLIC void command_set_viewport(zgfx_command *cmd, zgfx_viewport viewport) {
    assert(viewport.width > 0 && viewport.height != 0);
    assert(viewport.minDepth >= 0 && viewport.minDepth <= 1 &&
           viewport.maxDepth >= 0 && viewport.maxDepth <= 1);
+   viewport.y += viewport.height;
+   viewport.height = -viewport.height;
    float miny = MIN2(viewport.y, viewport.y + viewport.height);
    float maxy = MAX2(viewport.y, viewport.y + viewport.height);
    assert(viewport.x >= -32768 && viewport.x + viewport.width <= 32767 &&
