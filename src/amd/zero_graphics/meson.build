@@ -31,3 +31,15 @@ executable(
   dependencies : [dep_libdrm, dependency('xcb'), dependency('xcb-dri3'), dependency('xcb-present'), dependency('x11'), dependency('x11-xcb')],
   install : false,
 )
+
+zgfx_glfw_dep = dependency('glfw3', version : '>=3.4', required : false)
+zgfx_xlib_xcb_dep = dependency('x11-xcb', required : false)
+if zgfx_glfw_dep.found() and zgfx_xlib_xcb_dep.found()
+  executable(
+    'zgfx_demo_glfw',
+    'demo_glfw.c',
+    link_with : libzgfx,
+    dependencies : [zgfx_glfw_dep, zgfx_xlib_xcb_dep],
+    install : false,
+  )
+endif
