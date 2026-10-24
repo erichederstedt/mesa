@@ -55,12 +55,9 @@ void command_destroy(zgfx_command *cmd);
 void command_nop(zgfx_command *cmd);
 void command_clear(zgfx_command *cmd, void *backbuffer, uint32_t color /*0xAABBGGRR*/, uint64_t size);
 void command_set_compute_shader(zgfx_command *cmd, zgfx_shader* shader);
-void command_set_compute_shader_arg(zgfx_command *cmd, zgfx_shader* shader, void* data);
 void command_dispatch(zgfx_command *cmd, int x, int y, int z);
 void command_set_vertex_shader(zgfx_command *cmd, zgfx_shader* shader);
-void command_set_vertex_shader_arg(zgfx_command *cmd, zgfx_shader* shader, void* data);
 void command_set_pixel_shader(zgfx_command *cmd, zgfx_shader* shader);
-void command_set_pixel_shader_arg(zgfx_command *cmd, zgfx_shader* shader, void* data);
 void command_draw(zgfx_command *cmd, int vertexCount);
 void command_set_viewport(zgfx_command *cmd, zgfx_viewport viewport); // just single view port for now
 void command_set_rendertarget(zgfx_command *cmd, void* rendertarget, uint64_t width, uint64_t height, zgfx_color_format format);
@@ -133,6 +130,18 @@ void command_set_pixel_shader_args_impl(zgfx_command *cmd, zgfx_shader* shader, 
     command_set_pixel_shader_args_impl((cmd), (shader),    \
                   (Args[]){ MAP(LVAL_ARG, __VA_ARGS__) },   \
                   NARGS(__VA_ARGS__))
+
+void command_set_compute_shader_arg_impl(zgfx_command *cmd, zgfx_shader* shader, uint32_t index, const void *value, size_t size);
+#define command_set_compute_shader_arg(cmd, shader, index, x) \
+    command_set_compute_shader_arg_impl((cmd), (shader), (index), &(x), sizeof(x))
+
+void command_set_vertex_shader_arg_impl(zgfx_command *cmd, zgfx_shader* shader, uint32_t index, const void *value, size_t size);
+#define command_set_vertex_shader_arg(cmd, shader, index, x) \
+    command_set_vertex_shader_arg_impl((cmd), (shader), (index), &(x), sizeof(x))
+
+void command_set_pixel_shader_arg_impl(zgfx_command *cmd, zgfx_shader* shader, uint32_t index, const void *value, size_t size);
+#define command_set_pixel_shader_arg(cmd, shader, index, x) \
+    command_set_pixel_shader_arg_impl((cmd), (shader), (index), &(x), sizeof(x))
 
 #ifdef __cplusplus
 }

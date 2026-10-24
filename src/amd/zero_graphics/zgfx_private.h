@@ -12,6 +12,8 @@
 #include "compiler/shader_enums.h"
 
 #define MAX_BUFFER_COUNT 128
+#define ZGFX_MAX_ARG_DWORDS 16
+#define ZGFX_MAX_USER_SGPRS 16
 struct zgfx_device {
    int fd;
    amdgpu_device_handle device_handle;
@@ -50,7 +52,13 @@ struct zgfx_shader {
    uint32_t wave_size;
    uint32_t num_user_sgprs;
    struct ac_shader_args args;
-   struct ac_arg argument_ptr;
+   uint32_t arg_count;
+   struct {
+      uint16_t offset;
+      uint16_t size;
+   } arg_layout[ZGFX_MAX_ARG_DWORDS];
+   uint32_t arg_dwords;
+   struct ac_arg arg_regs[ZGFX_MAX_ARG_DWORDS];
    uint8_t vs_param_offsets[NUM_TOTAL_VARYING_SLOTS];
    uint32_t vs_param_exports;
    uint32_t spi_shader_pos_format;

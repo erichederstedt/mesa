@@ -84,11 +84,56 @@ static bool shader_lower_arguments(nir_builder *b, nir_intrinsic_instr *intrin, 
       return false;
 
    b->cursor = nir_before_instr(&intrin->instr);
-   nir_def *ptr = ac_nir_load_arg(b, &shader->args, shader->argument_ptr);
    unsigned offset = nir_intrinsic_base(intrin) + nir_src_as_uint(intrin->src[0]);
-   nir_def *value = nir_extract_bits(b, &ptr, 1, offset * 8,
+   unsigned size = intrin->def.num_components * intrin->def.bit_size / 8;
+   unsigned first = offset / 4, last = DIV_ROUND_UP(offset + size, 4);
+   nir_def *dwords[ZGFX_MAX_ARG_DWORDS];
+   for (unsigned i = first; i < last; i++)
+      dwords[i - first] = ac_nir_load_arg(b, &shader->args, shader->arg_regs[i]);
+   nir_def *value = nir_extract_bits(b, dwords, last - first, (offset - first * 4) * 8,
                                      intrin->def.num_components, intrin->def.bit_size);
    nir_def_replace(&intrin->def, value);
+   return true;
+}
+
+static bool shader_reflect_arguments(nir_shader *nir, zgfx_shader *shader)
+{
+   const struct glsl_type *block = NULL;
+   nir_foreach_variable_with_modes(var, nir, nir_var_mem_push_const) {
+      if (block) {
+         fprintf(stderr, "zgfx: shaders may only have one push-constant block\n");
+         return false;
+      }
+      block = var->type;
+   }
+   if (!block)
+      return true;
+
+   bool is_struct = glsl_type_is_struct_or_ifc(block);
+   unsigned count = is_struct ? glsl_get_length(block) : 1;
+   if (count > ZGFX_MAX_ARG_DWORDS) {
+      fprintf(stderr, "zgfx: shader has too many arguments\n");
+      return false;
+   }
+   unsigned end_dword = 0;
+   for (unsigned i = 0; i < count; i++) {
+      const struct glsl_type *type = is_struct ? glsl_get_struct_field(block, i) : block;
+      unsigned offset = is_struct ? glsl_get_struct_field_offset(block, i) : 0;
+      unsigned size = glsl_get_explicit_size(type, false);
+      if (!size || offset / 4 < end_dword) {
+         fprintf(stderr, "zgfx: shader arguments must not share a dword\n");
+         return false;
+      }
+      end_dword = DIV_ROUND_UP(offset + size, 4);
+      if (end_dword > ZGFX_MAX_ARG_DWORDS) {
+         fprintf(stderr, "zgfx: shader arguments exceed %u bytes\n", ZGFX_MAX_ARG_DWORDS * 4);
+         return false;
+      }
+      shader->arg_layout[i].offset = offset;
+      shader->arg_layout[i].size = size;
+   }
+   shader->arg_count = count;
+   shader->arg_dwords = end_dword;
    return true;
 }
 
@@ -258,10 +303,6 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
          fprintf(stderr, "zgfx: shader descriptors are not supported; use physical pointers\n");
          goto fail;
       }
-      if (var->data.mode == nir_var_mem_push_const && glsl_get_explicit_size(var->type, false) > 8) {
-         fprintf(stderr, "zgfx: push constants must fit the 8-byte argument pointer\n");
-         goto fail;
-      }
    }
    uint64_t workgroup_size = 1;
    for (unsigned i = 0; stage == MESA_SHADER_COMPUTE && i < 3; i++) {
@@ -285,6 +326,8 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
    nir->info.max_subgroup_size = shader->wave_size;
    for (unsigned i = 0; i < 3; i++)
       shader->workgroup_size[i] = nir->info.workgroup_size[i];
+   if (!shader_reflect_arguments(nir, shader))
+      goto fail;
 
    NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_function_temp);
    NIR_PASS(_, nir, nir_lower_returns);
@@ -328,12 +371,18 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
       goto fail;
 
    struct ac_shader_args *args = &shader->args;
-   ac_add_arg(args, AC_ARG_SGPR, 2, AC_ARG_VALUE, &shader->argument_ptr);
+   for (unsigned i = 0; i < shader->arg_dwords; i++)
+      ac_add_arg(args, AC_ARG_SGPR, 1, AC_ARG_VALUE, &shader->arg_regs[i]);
    if (stage == MESA_SHADER_VERTEX)
       ac_add_arg(args, AC_ARG_SGPR, 1, AC_ARG_VALUE, &args->base_vertex);
    if (stage == MESA_SHADER_COMPUTE && BITSET_TEST(nir->info.system_values_read, SYSTEM_VALUE_NUM_WORKGROUPS))
       ac_add_arg(args, AC_ARG_SGPR, 3, AC_ARG_VALUE, &args->num_work_groups);
    shader->num_user_sgprs = args->num_sgprs_used;
+   if (shader->num_user_sgprs > ZGFX_MAX_USER_SGPRS) {
+      fprintf(stderr, "zgfx: shader arguments need %u user SGPRs, at most %u are available\n",
+              shader->num_user_sgprs, ZGFX_MAX_USER_SGPRS);
+      goto fail;
+   }
    if (stage == MESA_SHADER_VERTEX) {
       ac_add_arg(args, AC_ARG_VGPR, 1, AC_ARG_VALUE, &args->vertex_id);
    } else if (stage == MESA_SHADER_FRAGMENT) {
@@ -365,8 +414,9 @@ PUBLIC zgfx_shader *shader_create(zgfx_device *dev, uint8_t *spriv_bytes,
                continue;
             uint64_t size = intrin->def.num_components * intrin->def.bit_size / 8;
             if (!nir_src_is_const(intrin->src[0]) ||
-                (uint64_t)nir_intrinsic_base(intrin) + nir_src_as_uint(intrin->src[0]) + size > 8) {
-               fprintf(stderr, "zgfx: push-constant access exceeds the argument pointer\n");
+                (uint64_t)nir_intrinsic_base(intrin) + nir_src_as_uint(intrin->src[0]) + size >
+                   shader->arg_dwords * 4) {
+               fprintf(stderr, "zgfx: push-constant access exceeds the shader arguments\n");
                goto fail;
             }
          }

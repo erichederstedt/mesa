@@ -92,11 +92,7 @@ int main(void)
          result = 1;
          break;
       }
-      zgfx_swapchain_info info;
-      if (swapchain_get_info(swapchain, &info) != ZGFX_SWAPCHAIN_READY) {
-         result = 1;
-         break;
-      }
+      zgfx_swapchain_info info = swapchain_get_info(swapchain);
 
       command_reset(cmd);
       command_clear(cmd, frame, 0xff202020, 0);

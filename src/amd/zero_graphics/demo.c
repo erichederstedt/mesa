@@ -79,7 +79,7 @@ int main(void) {
    uint32_t* target = galloc(dev, sizeof(uint32_t) * 32);
    print_array("target", target, 32);
    command_set_compute_shader(cmd, shader);
-   command_set_compute_shader_arg(cmd, shader, target);
+   command_set_compute_shader_args(cmd, shader, target);
    command_dispatch(cmd, 32, 1, 1);
    queue_submit(dev, cmd);
    print_array("target", target, 32);
@@ -113,9 +113,9 @@ int main(void) {
       .minDepth = 0, .maxDepth = 1,
    });
    command_set_vertex_shader(cmd, vs_shader);
-   command_set_vertex_shader_arg(cmd, vs_shader, vertices);
+   command_set_vertex_shader_args(cmd, vs_shader, vertices);
    command_set_pixel_shader(cmd, ps_shader);
-   command_set_pixel_shader_arg(cmd, ps_shader, triColor);
+   command_set_pixel_shader_args(cmd, ps_shader, triColor);
    command_draw(cmd, 3);
    queue_submit(dev, cmd);
    stbi_write_bmp("pos_output.bmp", 1024, 1024, 4, backbuffer);
@@ -253,9 +253,9 @@ int main(void) {
                .width = info.width, .height = info.height, .minDepth = 0, .maxDepth = 1,
             });
             command_set_vertex_shader(cmd, vs_shader);
-            command_set_vertex_shader_arg(cmd, vs_shader, vertices);
+            command_set_vertex_shader_args(cmd, vs_shader, vertices);
             command_set_pixel_shader(cmd, ps_shader);
-            command_set_pixel_shader_arg(cmd, ps_shader, triColor);
+            command_set_pixel_shader_args(cmd, ps_shader, triColor);
             command_draw(cmd, 3);
             queue_submit(dev, cmd);
             if (swapchain_present(swapchain, frame) != 0) {
@@ -359,10 +359,9 @@ cleanup:
          .width = info.width, .height = info.height, .minDepth = 0, .maxDepth = 1,
       });
       command_set_vertex_shader(cmd, vs_shader);
-      command_set_vertex_shader_arg(cmd, vs_shader, vertices);
-      // command_set_vertex_shader_args(cmd, vs_shader, vertices, vertices, vertices);
+      command_set_vertex_shader_args(cmd, vs_shader, vertices);
       command_set_pixel_shader(cmd, ps_shader);
-      command_set_pixel_shader_arg(cmd, ps_shader, triColor);
+      command_set_pixel_shader_args(cmd, ps_shader, triColor);
       command_draw(cmd, 3);
       queue_submit(dev, cmd);
       if (swapchain_present(swapchain, frame) != 0) {

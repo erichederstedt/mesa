@@ -653,24 +653,6 @@ PUBLIC void command_set_compute_shader(zgfx_command *cmd, zgfx_shader* shader) {
    ac_pm4_emit_commands(&cmd->cs, &pm4);
    cmd->compute_shader = shader;
 }
-PUBLIC void command_set_compute_shader_arg(zgfx_command *cmd, zgfx_shader* shader, void* data) {
-   assert(cmd && shader && cmd->dev == shader->dev);
-   assert(shader->type == ZGFX_SHADER_COMPUTE);
-   assert(shader->argument_ptr.used);
-
-   unsigned offset = R_00B900_COMPUTE_USER_DATA_0 +
-                     shader->args.args[shader->argument_ptr.arg_index].offset * 4;
-   uint64_t va = (uint64_t)(uintptr_t)data;
-   struct ac_pm4_state pm4 = {0};
-   ac_pm4_clear_state(&pm4, &cmd->dev->info, false, false);
-   ac_pm4_set_reg(&pm4, offset, va);
-   ac_pm4_set_reg(&pm4, offset + 4, va >> 32);
-   ac_pm4_finalize(&pm4);
-
-   if (cmd->cs.cdw + pm4.ndw > cmd->cs.max_dw)
-      command_grow(cmd);
-   ac_pm4_emit_commands(&cmd->cs, &pm4);
-}
 PUBLIC void command_dispatch(zgfx_command *cmd, int x, int y, int z) {
    assert(cmd && cmd->compute_shader);
    assert(x >= 0 && y >= 0 && z >= 0);
@@ -762,29 +744,6 @@ PUBLIC void command_set_vertex_shader(zgfx_command *cmd, zgfx_shader *shader) {
    cmd->vertex_shader = shader;
 }
 
-static void command_set_graphics_shader_args(zgfx_command *cmd, zgfx_shader *shader,
-                                             void *data, zgfx_shader_type type) {
-   assert(cmd && shader && cmd->dev == shader->dev && shader->type == type);
-   assert(shader->argument_ptr.used && cmd->dev->info.gfx_level < GFX11);
-
-   unsigned offset = type == ZGFX_SHADER_VERTEX ? R_00B130_SPI_SHADER_USER_DATA_VS_0 :
-                                                R_00B030_SPI_SHADER_USER_DATA_PS_0;
-   offset += shader->args.args[shader->argument_ptr.arg_index].offset * 4;
-   uint64_t va = (uint64_t)(uintptr_t)data;
-   struct ac_pm4_state pm4 = {0};
-   ac_pm4_clear_state(&pm4, &cmd->dev->info, false, false);
-   ac_pm4_set_reg(&pm4, offset, va);
-   ac_pm4_set_reg(&pm4, offset + 4, va >> 32);
-   ac_pm4_finalize(&pm4);
-   if (cmd->cs.cdw + pm4.ndw > cmd->cs.max_dw)
-      command_grow(cmd);
-   ac_pm4_emit_commands(&cmd->cs, &pm4);
-}
-
-PUBLIC void command_set_vertex_shader_arg(zgfx_command *cmd, zgfx_shader *shader, void *data) {
-   command_set_graphics_shader_args(cmd, shader, data, ZGFX_SHADER_VERTEX);
-}
-
 PUBLIC void command_set_pixel_shader(zgfx_command *cmd, zgfx_shader *shader) {
    assert(cmd && shader && cmd->dev == shader->dev);
    assert(shader->type == ZGFX_SHADER_PIXEL);
@@ -816,10 +775,6 @@ PUBLIC void command_set_pixel_shader(zgfx_command *cmd, zgfx_shader *shader) {
       command_grow(cmd);
    ac_pm4_emit_commands(&cmd->cs, &pm4);
    cmd->pixel_shader = shader;
-}
-
-PUBLIC void command_set_pixel_shader_arg(zgfx_command *cmd, zgfx_shader *shader, void *data) {
-   command_set_graphics_shader_args(cmd, shader, data, ZGFX_SHADER_PIXEL);
 }
 
 PUBLIC void command_draw(zgfx_command *cmd, int vertexCount) {
@@ -1126,16 +1081,70 @@ PUBLIC void queue_submit(zgfx_device *dev, zgfx_command *cmd) {
 }
 
 
+static void command_emit_shader_args(zgfx_command *cmd, zgfx_shader *shader, zgfx_shader_type type,
+                                     unsigned first_dword, const uint32_t *data, unsigned count) {
+   assert(cmd && shader && cmd->dev == shader->dev && shader->type == type);
+   assert(type == ZGFX_SHADER_COMPUTE || cmd->dev->info.gfx_level < GFX11);
+   assert(first_dword + count <= shader->arg_dwords);
+   if (!count)
+      return;
+
+   unsigned offset = type == ZGFX_SHADER_COMPUTE ? R_00B900_COMPUTE_USER_DATA_0 :
+                     type == ZGFX_SHADER_VERTEX  ? R_00B130_SPI_SHADER_USER_DATA_VS_0 :
+                                                   R_00B030_SPI_SHADER_USER_DATA_PS_0;
+   offset += (shader->args.args[shader->arg_regs[0].arg_index].offset + first_dword) * 4;
+   struct ac_pm4_state pm4 = {0};
+   ac_pm4_clear_state(&pm4, &cmd->dev->info, false, false);
+   for (unsigned i = 0; i < count; i++)
+      ac_pm4_set_reg(&pm4, offset + i * 4, data[i]);
+   ac_pm4_finalize(&pm4);
+   if (cmd->cs.cdw + pm4.ndw > cmd->cs.max_dw)
+      command_grow(cmd);
+   ac_pm4_emit_commands(&cmd->cs, &pm4);
+}
+
+static void command_set_shader_arg(zgfx_command *cmd, zgfx_shader *shader, zgfx_shader_type type,
+                                   uint32_t index, const void *value, size_t size) {
+   assert(shader && value && index < shader->arg_count);
+   assert(size == shader->arg_layout[index].size);
+
+   unsigned offset = shader->arg_layout[index].offset;
+   uint32_t data[ZGFX_MAX_ARG_DWORDS] = {0};
+   memcpy((uint8_t *)data + offset % 4, value, size);
+   command_emit_shader_args(cmd, shader, type, offset / 4, data, DIV_ROUND_UP(offset % 4 + size, 4));
+}
+
+static void command_set_shader_args(zgfx_command *cmd, zgfx_shader *shader, zgfx_shader_type type,
+                                    const Args *args, size_t count) {
+   assert(shader && args && count == shader->arg_count);
+
+   uint32_t data[ZGFX_MAX_ARG_DWORDS] = {0};
+   for (size_t i = 0; i < count; i++) {
+      assert(args[i].ptr && args[i].size == shader->arg_layout[i].size);
+      memcpy((uint8_t *)data + shader->arg_layout[i].offset, args[i].ptr, args[i].size);
+   }
+   command_emit_shader_args(cmd, shader, type, 0, data, shader->arg_dwords);
+}
+
+PUBLIC void command_set_compute_shader_arg_impl(zgfx_command *cmd, zgfx_shader *shader, uint32_t index,
+                                                const void *value, size_t size) {
+   command_set_shader_arg(cmd, shader, ZGFX_SHADER_COMPUTE, index, value, size);
+}
+PUBLIC void command_set_vertex_shader_arg_impl(zgfx_command *cmd, zgfx_shader *shader, uint32_t index,
+                                               const void *value, size_t size) {
+   command_set_shader_arg(cmd, shader, ZGFX_SHADER_VERTEX, index, value, size);
+}
+PUBLIC void command_set_pixel_shader_arg_impl(zgfx_command *cmd, zgfx_shader *shader, uint32_t index,
+                                              const void *value, size_t size) {
+   command_set_shader_arg(cmd, shader, ZGFX_SHADER_PIXEL, index, value, size);
+}
+
 PUBLIC void command_set_compute_shader_args_impl(zgfx_command *cmd, zgfx_shader *shader, Args *args, size_t count) {
-   // Implement
+   command_set_shader_args(cmd, shader, ZGFX_SHADER_COMPUTE, args, count);
 }
 PUBLIC void command_set_vertex_shader_args_impl(zgfx_command *cmd, zgfx_shader *shader, Args *args, size_t count) {
-   // Implement
-   for (size_t i = 0; i < count; i++)
-   {
-      printf("%zu\n", args[i].size);
-   }
+   command_set_shader_args(cmd, shader, ZGFX_SHADER_VERTEX, args, count);
 }
 PUBLIC void command_set_pixel_shader_args_impl(zgfx_command *cmd, zgfx_shader *shader, Args *args, size_t count) {
-   // Implement
+   command_set_shader_args(cmd, shader, ZGFX_SHADER_PIXEL, args, count);
 }
